@@ -23,6 +23,7 @@ struct trace_entry
 struct trace_data
 {
     int pos;
+    unsigned char pad[16-sizeof(int)];
     trace_entry buf[FUNTRACE_BUF_SIZE/sizeof(trace_entry)];
     pthread_t thread;
 
@@ -48,7 +49,7 @@ struct trace_global_state
     }
 };
 
-thread_local trace_data g_thread_trace;
+thread_local trace_data g_thread_trace __attribute__((aligned(16))) ;
 trace_global_state g_trace_state;
 
 //FIXME: don't do this via a global ctor!
@@ -71,9 +72,23 @@ static inline void NOINSTR trace(void* ptr, uint64_t is_ret)
     static_assert(sizeof(trace_entry) == 16);
     int pos = g_thread_trace.pos;
     trace_entry* entry = (trace_entry*)((uint64_t)&g_thread_trace.buf + pos);
+    //__builtin_prefetch(entry+4, 1, 0); this generates prefetchw and doesn't impact povray's runtime
     pos = (pos+16) & (sizeof(g_thread_trace.buf)-1);
-    entry->func = (void*)(((uint64_t)ptr) | (is_ret << 63));
+
+    uint64_t func = ((uint64_t)ptr) | (is_ret << 63);
+    //straightforward writing:
+    entry->func = (void*)func;
     entry->cycle = cycle;
+
+    //this generates movntq and makes povray slower relatively to straightforward writing
+    //__m64* pm64 = (__m64*)entry;
+    //_mm_stream_pi(pm64, _m_from_int64(func));
+    //_mm_stream_pi(pm64+1, _m_from_int64(cycle));
+
+    //this generates vmovntdq and also makes povray slower
+    //__m128i xmm = _mm_set_epi64x(cycle, func);
+    //_mm_stream_si128((__m128i*)entry, xmm);
+
     g_thread_trace.pos = pos;
 }
 
