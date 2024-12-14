@@ -125,17 +125,27 @@ fn main() {
         let vaddr_offset = offset_cache.get(&map.address.0).unwrap();
         address = address - map.address.0 + vaddr_offset;
 
-        let location = meta.addr2line.find_location(address).unwrap().unwrap();
+        let (file, linenum) = match meta.addr2line.find_location(address) {
+            Ok(Some(location)) => (location.file.unwrap_or("??"), location.line.unwrap_or(0)),
+            _ => ("??",0),
+        };
 
         //it could be better to use ELF symbol table lookup instead of DWARF name info
         //(which has the advantage of having inlining information, with said advantage completely useless
         //for us); this was done for writing little code and hopefully getting something more efficient
         //than a linear lookup
-        let frames = meta.addr2line.find_frames(address).skip_all_loads().unwrap();
-        let frame = frames.last().unwrap().unwrap();
-        let name = frame.function.as_ref().unwrap().raw_name().unwrap();
+        let mut name = "??".to_string();
+        if let Ok(frames) = meta.addr2line.find_frames(address).skip_all_loads() { 
+            if let Ok(Some(frame)) = frames.last() {
+                if let Some(funref) = frame.function.as_ref() {
+                    if let Ok(fname) = funref.raw_name() {
+                        name = fname.to_string();
+                    }
+                }
+            }
+        }
              
-        println!("{} {} {}:{} {}", count, parts[0], location.file.unwrap(), location.line.unwrap(), name.to_string());
+        println!("{} {} {}:{} {}", count, parts[0], file, linenum, name.to_string());
 
         line.clear();
     }

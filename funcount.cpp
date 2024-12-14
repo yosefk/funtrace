@@ -30,6 +30,7 @@ typedef uint64_t count_t;
 struct CountsPage
 {
     std::atomic<count_t> counts[PAGE_SIZE/sizeof(count_t)];
+    NOINSTR CountsPage() { memset(counts, 0, sizeof(counts)); }
 };
 
 struct CountsPagesL1
@@ -61,7 +62,7 @@ struct CountsPagesL2
         return page->counts[low / sizeof(count_t)];
     }
 
-    ~CountsPagesL2();
+    NOINSTR ~CountsPagesL2();
 };
 
 static CountsPagesL2 g_page_tab;
@@ -80,7 +81,7 @@ extern "C" void NOINSTR __cyg_profile_func_exit(void* func, void* caller) {}
 #include <vector>
 #include <iostream>
 
-CountsPagesL2::~CountsPagesL2()
+NOINSTR CountsPagesL2::~CountsPagesL2()
 {
     std::ofstream out("funcount.txt");
     out << "FUNCOUNT\nPROCMAPS\n";
