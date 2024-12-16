@@ -1,0 +1,10 @@
+[package]
+name = "procaddr2sym"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+addr2line = "0.20"
+goblin = "0.9.2"
+memmap2 = "0.9.5"
+procfs = "0.17.0"

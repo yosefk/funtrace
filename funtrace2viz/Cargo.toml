@@ -1,5 +1,5 @@
 [package]
-name = "funcount2sym"
+name = "funtrace2viz"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 procaddr2sym = { path = "../procaddr2sym" }
+bytemuck = { version="1.20.0", features = ["derive"] }

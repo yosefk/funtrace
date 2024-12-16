@@ -1,0 +1,2 @@
+[workspace]
+members = ["procaddr2sym", "funcount2sym", "funtrace2viz"]

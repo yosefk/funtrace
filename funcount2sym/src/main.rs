@@ -1,44 +1,13 @@
-use addr2line::{
-    Context,
-    object,
-    gimli::{EndianReader, RunTimeEndian},
-};
-use addr2line::fallible_iterator::FallibleIterator;
-use std::rc::Rc;
-use procfs::process::{MemoryMaps, MemoryMap, MMapPath};
-use procfs::FromBufRead;
-use goblin::elf::{Elf, ProgramHeader};
-use std::collections::HashMap;
+use procaddr2sym::ProcAddr2Sym;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::env;
-use memmap2::Mmap;
 
 macro_rules! fail {
     ($($arg:tt)*) => {{
         println!($($arg)*);
         std::process::exit(1);
     }};
-}
-
-fn find_address_in_maps(address: u64, maps: &Vec<MemoryMap>) -> Option<&MemoryMap> {
-    maps.binary_search_by(|map| {
-        if address < map.address.0 {
-            std::cmp::Ordering::Greater // Address is before this map
-        } else if address >= map.address.1 {
-            std::cmp::Ordering::Less // Address is after this map
-        } else {
-            std::cmp::Ordering::Equal // Address is within this map
-        }
-    })
-    .ok()
-    .map(|index| &maps[index])
-}
-
-struct ExecutableFileMetadata
-{
-    program_headers: Vec<ProgramHeader>,
-    addr2line: Context<EndianReader<RunTimeEndian, Rc<[u8]>>>,
 }
 
 fn main() {
@@ -75,77 +44,19 @@ fn main() {
     if !found { fail!("COUNTS magic string not found"); }
     line.clear();
 
-    let memory_maps = MemoryMaps::from_buf_read(proc_maps_data.as_bytes()).expect("failed to parse /proc/self/map data");
-    let mut maps: Vec<_> = memory_maps.into_iter().collect();
-    // not sure we need to sort them - /proc/self/maps appears already sorted - but can't hurt
-    maps.sort_by_key(|map| map.address.0);
-
-    // Parse the (address, count) pairs
-    let mut sym_cache: HashMap<String, ExecutableFileMetadata> = HashMap::new();
-    let mut offset_cache: HashMap<u64, u64> = HashMap::new();
+    let mut procaddr2sym = ProcAddr2Sym::new();
+    procaddr2sym.set_proc_maps(proc_maps_data.as_bytes());
 
     while reader.read_line(&mut line).expect("failure reading input file") > 0 {
         let parts: Vec<&str> = line.trim().split_whitespace().collect();
         if parts.len() != 2 { fail!("Invalid address-count pair {}", line); }
 
-        let mut address = u64::from_str_radix(parts[0].trim_start_matches("0x"), 16).expect("bad address");
+        let address = u64::from_str_radix(parts[0].trim_start_matches("0x"), 16).expect("bad address");
         let count = parts[1].parse::<u64>().expect("bad count");
 
-        let map = find_address_in_maps(address, &maps).expect("address not found in /proc/self/maps of the process which produced funcount.txt");
+        let syminfo = procaddr2sym.proc_addr2sym(address);
 
-        let path = match &map.pathname {
-            MMapPath::Path(p) => p,
-            _ => fail!("address doesn't have an associated executable file (mapping {:?})", map),
-        };
-        let pathstr = path.to_string_lossy().to_string();
-        if !sym_cache.contains_key(&pathstr) {
-            let file = File::open(path).expect("failed to open executable file");
-            let buffer = unsafe { Mmap::map(&file).expect("failed to mmap executable file") };
-            let elf = Elf::parse(&buffer).expect("Failed to parse ELF");
-            let program_headers = elf.program_headers.clone();
-            let object = object::File::parse(&*buffer).expect("Failed to parse ELF");
-            let ctx = addr2line::Context::new(&object).expect("Failed to create addr2line context");
-            sym_cache.insert(path.to_string_lossy().to_string(), ExecutableFileMetadata { program_headers, addr2line: ctx });
-        }
-        let meta = sym_cache.get(&pathstr).unwrap();
-
-        if !offset_cache.contains_key(&map.address.0) {
-            //find the program header containing the file offset of this mapping
-            let mut found = false;
-            for phdr in meta.program_headers.iter() {
-                if map.offset >= phdr.p_offset && map.offset < (phdr.p_offset + phdr.p_filesz) {
-                    let vaddr_offset = (map.offset - phdr.p_offset) + phdr.p_vaddr;
-                    offset_cache.insert(map.address.0, vaddr_offset);
-                    found = true;
-                    break;
-                }
-            }
-            if !found { fail!("can't find the program header containing the mapping"); }
-        }
-        let vaddr_offset = offset_cache.get(&map.address.0).unwrap();
-        address = address - map.address.0 + vaddr_offset;
-
-        let (file, linenum) = match meta.addr2line.find_location(address) {
-            Ok(Some(location)) => (location.file.unwrap_or("??"), location.line.unwrap_or(0)),
-            _ => ("??",0),
-        };
-
-        //it could be better to use ELF symbol table lookup instead of DWARF name info
-        //(which has the advantage of having inlining information, with said advantage completely useless
-        //for us); this was done for writing little code and hopefully getting something more efficient
-        //than a linear lookup
-        let mut name = "??".to_string();
-        if let Ok(frames) = meta.addr2line.find_frames(address).skip_all_loads() { 
-            if let Ok(Some(frame)) = frames.last() {
-                if let Some(funref) = frame.function.as_ref() {
-                    if let Ok(fname) = funref.raw_name() {
-                        name = fname.to_string();
-                    }
-                }
-            }
-        }
-             
-        println!("{} {} {}:{} {}", count, parts[0], file, linenum, name.to_string());
+        println!("{} {} {}:{} {}", count, parts[0], syminfo.file, syminfo.line, syminfo.func);
 
         line.clear();
     }
