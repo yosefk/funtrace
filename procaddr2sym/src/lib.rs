@@ -38,7 +38,7 @@ pub struct ProcAddr2Sym {
     offset_cache: HashMap<u64, u64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Hash, PartialEq, std::cmp::Eq)]
 pub struct SymInfo {
     pub func: String,
     pub demangled_func: String,

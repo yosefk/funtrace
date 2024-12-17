@@ -3,9 +3,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::io::prelude::*;
 use std::mem;
 use bytemuck::{Pod, Zeroable};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use procaddr2sym::{ProcAddr2Sym, SymInfo};
 use std::env;
+use serde_json::Value;
 
 const RETURN_BIT: i32 = 63;
 const MAGIC_LEN: usize = 8;
@@ -27,8 +28,50 @@ fn start_json(mut json: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn finish_json(mut json: &File) -> io::Result<()> {
-    json.write(b"]\n}\n")?;
+struct SourceCode {
+    json_str: String,
+    num_lines: usize,
+}
+
+fn finish_json(mut json: &File, source_cache: &HashMap<String, SourceCode>, funcset: &mut HashSet<SymInfo>) -> io::Result<()> {
+    json.write(b"],\n")?;
+    // find the source files containing the functions in this sample's set
+    let mut fileset: HashSet<String> = HashSet::new();
+    for sym in funcset.iter() {
+        fileset.insert(sym.file.clone());
+    }
+    json.write(br#""viztracer_metadata": {
+  "version": "0.16.3",
+  "overflow": false,
+  "producer": "funtrace2viz"
+},
+"file_info": {
+"files": {
+"#)?;
+
+    // dump the source code of these files into the json
+    for (i, file) in fileset.iter().enumerate() {
+        if let Some(&ref source_code) = source_cache.get(file) {
+            json.write(Value::String(file.clone()).to_string().as_bytes())?;
+            json.write(b":[")?;
+            json.write(source_code.json_str.as_bytes())?;
+            json.write(b",")?;
+            json.write(format!("{}", source_code.num_lines).as_bytes())?;
+            //json.write(Value::String(String::from_utf8(*source_code).unwrap()).to_string().as_bytes())?;
+            json.write(if i==fileset.len()-1 { b"]\n" } else { b"],\n" })?;
+        }
+    }
+    json.write(br#"},
+"functions": {
+"#)?;
+
+    // tell where each function is defined
+    for (i, sym) in funcset.iter().enumerate() {
+        json.write(format!("{}:[{},{}]{}\n", json_name(sym), Value::String(sym.file.clone()).to_string(), sym.line, if i==funcset.len()-1 { "" } else { "," }).as_bytes())?;
+    }
+    json.write(b"}}}\n")?;
+
+    funcset.clear();
     Ok(())
 }
 
@@ -40,6 +83,10 @@ fn format_json_filename(basename: &String, number: u32) -> String {
     }
 }
 
+fn json_name(sym: &SymInfo) -> String {
+    Value::String(format!("{} ({}:{})",sym.demangled_func, sym.file, sym.line)).to_string()
+}
+
 fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
     let mut file = File::open(file_path)?;
     let mut procaddr2sym = ProcAddr2Sym::new();
@@ -49,6 +96,14 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
     let mut json_opt = None;
     let mut num_json = 0;
     let mut tid = 1;
+
+    // we dump source code into the JSON files to make it visible in vizviewer
+    let mut source_cache = HashMap::new();
+    // we also list the set of functions (to tell their file, line pair to vizviewer);
+    // we also use this set to only dump the relevant part of the source cache to each
+    // json (the source cache persists across samples/jsons but not all files are relevant
+    // to all samples)
+    let mut funcset: HashSet<SymInfo> = HashSet::new();
 
     loop {
         //the file consists of chunks with an 8-byte magic string telling the chunk
@@ -73,7 +128,7 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
                 match json_opt {
                     Some(ref json) => {
                         println!("warning: FUNTRACE block not closed");
-                        finish_json(json)?;
+                        finish_json(json, &source_cache, &mut funcset)?;
                     },
                     _ => {}
                 }
@@ -83,7 +138,7 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
             }
             else {
                 match json_opt {
-                    Some(ref json) => { finish_json(&json)?; },
+                    Some(ref json) => { finish_json(&json, &source_cache, &mut funcset)?; } 
                     _ => { println!("warning: ENDTRACE without a preceding FUNTRACE"); }
                 }
                 json_opt = None;
@@ -116,10 +171,9 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
                 continue;
             }
             let mut json = json_opt.as_ref().unwrap();
-
             let earliest_cycle = entries[0].cycle;
 
-            for entry in entries {
+            for (i, entry) in entries.iter().enumerate() {
                 let ret = entry.address >> RETURN_BIT;
                 let addr = entry.address & !(1<<RETURN_BIT);
                 if !sym_cache.contains_key(&addr) {
@@ -127,7 +181,7 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
                 }
                 if ret == 0 {
                     // call
-                    stack.push(entry);
+                    stack.push(*entry);
                 }
                 else {
                     //write an event to json
@@ -140,9 +194,22 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
                         stack.pop().unwrap().cycle
                     };
                     let sym = sym_cache.get(&addr).unwrap();
-                    json.write(format!(r#"{{"tid":{},"ts":{},"dur":{},"name":"{} ({}:{})","ph":"X"}},
+                    json.write(format!(r#"{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X"}}{}
 "#, 
-                                tid, call_cycle, entry.cycle-call_cycle, sym.demangled_func, sym.file, sym.line).as_bytes())?; 
+                                tid, call_cycle, entry.cycle-call_cycle, json_name(sym), if i==entries.len()-1 { "" } else { "," }).as_bytes())?; 
+                    funcset.insert(sym.clone());
+
+                    //cache the source code if it's the first time we see this file
+                    if !source_cache.contains_key(&sym.file) {
+                        let mut source_code: Vec<u8> = Vec::new();
+                        if let Ok(mut source_file) = File::open(&sym.file) {
+                            source_file.read_to_end(&mut source_code)?;
+                        }
+                        let json_str = Value::String(String::from_utf8(source_code.clone()).unwrap()).to_string();
+                        let num_lines = source_code.iter().filter(|&&b| b == b'\n').count(); //TODO: num newlines
+                        //might be off by one relatively to num lines...
+                        source_cache.insert(sym.file.clone(), SourceCode{ json_str, num_lines });
+                    }
                 }
             }
             tid += 1;
