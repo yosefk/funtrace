@@ -48,11 +48,11 @@ void funtrace_pause_and_write_current_snapshot();
 struct funtrace_procmaps;
 struct funtrace_snapshot;
 
-struct funtrace_procmaps* funtrace_save_procmaps();
+struct funtrace_procmaps* funtrace_get_procmaps();
 /* a snapshot has the size FUNTRACE_BUF_SIZE times the number of threads alive
    at the time when it's taken. threads can't be created and can't terminate
    until the trace data is copied into the snapshot */
-struct funtrace_snapshot* funtrace_pause_and_save_snapshot();
+struct funtrace_snapshot* funtrace_pause_and_get_snapshot();
 void funtrace_free_procmaps(struct funtrace_procmaps* procmaps);
 void funtrace_free_snapshot(struct funtrace_snapshot* snapshot);
 

@@ -5,8 +5,8 @@ use std::mem;
 use bytemuck::{Pod, Zeroable};
 use std::collections::{HashMap, HashSet};
 use procaddr2sym::{ProcAddr2Sym, SymInfo};
-use std::env;
 use serde_json::Value;
+use clap::Parser;
 
 const RETURN_BIT: i32 = 63;
 const MAGIC_LEN: usize = 8;
@@ -87,11 +87,10 @@ fn json_name(sym: &SymInfo) -> String {
     Value::String(format!("{} ({}:{})",sym.demangled_func, sym.file, sym.line)).to_string()
 }
 
-fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
+fn parse_chunks(file_path: &String, json_basename: &String, max_cycles_in_thread: Option<u64>) -> io::Result<()> {
     let mut file = File::open(file_path)?;
     let mut procaddr2sym = ProcAddr2Sym::new();
     let mut sym_cache: HashMap<u64, SymInfo> = HashMap::new();
-    let mut stack: Vec<FunTraceEntry> = Vec::new();
 
     let mut json_opt = None;
     let mut num_json = 0;
@@ -104,6 +103,7 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
     // json (the source cache persists across samples/jsons but not all files are relevant
     // to all samples)
     let mut funcset: HashSet<SymInfo> = HashSet::new();
+    let mut first_event = true;
 
     loop {
         //the file consists of chunks with an 8-byte magic string telling the chunk
@@ -132,8 +132,11 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
                     },
                     _ => {}
                 }
-                json_opt = Some(File::create(format_json_filename(json_basename, num_json))?);
+                let fname = format_json_filename(json_basename, num_json);
+                json_opt = Some(File::create(fname.clone())?);
                 start_json(&json_opt.as_ref().unwrap())?;
+                println!("decoding a trace sample into {}...", fname);
+                first_event = true;
                 tid = 1;
             }
             else {
@@ -164,6 +167,7 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
             let num_entries = chunk_length / mem::size_of::<FunTraceEntry>();
             let mut entries = vec![FunTraceEntry { address: 0, cycle: 0 }; num_entries];
             file.read_exact(bytemuck::cast_slice_mut(&mut entries))?;
+
             entries.sort_by_key(|entry| entry.cycle);
 
             if !json_opt.is_some() {
@@ -171,9 +175,20 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
                 continue;
             }
             let mut json = json_opt.as_ref().unwrap();
+            let mut stack: Vec<FunTraceEntry> = Vec::new();
+            let mut num_events = 0;
             let earliest_cycle = entries[0].cycle;
+            let latest_cycle = entries[entries.len()-1].cycle;
+            let mut num_orphan_returns = 0;
 
-            for (i, entry) in entries.iter().enumerate() {
+            if let Some(max_cycles) = max_cycles_in_thread {
+                if latest_cycle - earliest_cycle > max_cycles {
+                    println!("ignoring an 'inactive' thread which spans {} cycles (>{})", latest_cycle-earliest_cycle, max_cycles);
+                    continue;
+                }
+            }
+            
+            for entry in entries {
                 let ret = entry.address >> RETURN_BIT;
                 let addr = entry.address & !(1<<RETURN_BIT);
                 if !sym_cache.contains_key(&addr) {
@@ -181,23 +196,31 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
                 }
                 if ret == 0 {
                     // call
-                    stack.push(*entry);
+                    stack.push(entry);
                 }
                 else {
                     //write an event to json
                     let call_cycle = if stack.is_empty() {
+                        num_orphan_returns += 1;
                         // a return without a call - the call event must have been overwritten
                         // in the cyclic trace buffer; fake a call at the start of the trace
-                        earliest_cycle
+                        //
+                        // the "-num_orphan_returns" is here because vizviewer / Perfetto is
+                        // thrown off by multiple calls starting at the same cycle and puts
+                        // them in the wrong lane on the timeline
+                        earliest_cycle - num_orphan_returns
                     }
                     else {
                         stack.pop().unwrap().cycle
                     };
                     let sym = sym_cache.get(&addr).unwrap();
-                    json.write(format!(r#"{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X"}}{}
-"#, 
-                                tid, call_cycle, entry.cycle-call_cycle, json_name(sym), if i==entries.len()-1 { "" } else { "," }).as_bytes())?; 
+                    json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X"}}"#, 
+                                if first_event { "" } else { "\n," },
+                                tid, call_cycle, entry.cycle-call_cycle, json_name(sym)).as_bytes())?; 
+
+                    first_event = false;
                     funcset.insert(sym.clone());
+                    num_events += 1;
 
                     //cache the source code if it's the first time we see this file
                     if !source_cache.contains_key(&sym.file) {
@@ -212,6 +235,8 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
                     }
                 }
             }
+            println!("thread {} - {} events, {} cycles", tid, num_events, latest_cycle-earliest_cycle);
+
             tid += 1;
         } else {
             println!("Unknown chunk type: {:?}", std::str::from_utf8(&magic).unwrap_or("<invalid>"));
@@ -222,14 +247,39 @@ fn parse_chunks(file_path: &String, json_basename: &String) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Parser)]
+#[clap(about="convert funtrace.raw to JSON files in the viztracer/vizviewer format (pip install viztracer)", version)]
+struct Cli {
+    #[clap(help="funtrace.raw input file with one or more trace samples")]
+    functrace_raw: String,
+    #[clap(help="basename.json, basename.1.json, basename.2.json... are created, one JSON file per trace sample")]
+    out_basename: String,
+    #[clap(short, long, help="maximal number of cycles in a thread - threads with more cycles are considered inactive [active threads fill up their trace buffer in few cycles] and ignored, avoiding the appearance of a giant blank timeline in vizviewer/Perfetto")]
+    max_cycles_in_thread: Option<u64>,
+    #[clap(short, long, help="ignore events older than this relatively to the latest recorded event (very old events create the appearance of a giant blank timeline in vizviewer/Perfetto which zooms out to show the recorded timeline in full)")]
+    oldest_event: Option<u64>,
+}
+
 fn main() -> io::Result<()> {
+    /*
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        println!("Usage: {} <funtrace.raw> <basename> #basename.json, basename.1.json, basename.2.json... are created, one file per trace sample", args[0]);
+    if args.len() != 3 && args.len() != 4 {
+        println!("Usage: {} <funtrace.raw> <basename> [max cycles in decoded thread] #basename.json, basename.1.json, basename.2.json... are created, one file per trace sample", args[0]);
         std::process::exit(1);
     }
     let raw_file = &args[1];
     let out_basename = &args[2];
-    parse_chunks(&raw_file, &out_basename)
+    let max_cycles_in_thread = if args.len() == 4 {
+        match args[3].parse::<u64>() {
+            Ok(cycles) => Some(cycles),
+            Err(e) => panic!("error parsing max cycles in decoded thread: {}", e)
+        }
+    }
+    else {
+        None
+    };
+    */
+    let args = Cli::parse();
+    parse_chunks(&args.functrace_raw, &args.out_basename, args.max_cycles_in_thread)
 }
 

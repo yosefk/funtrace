@@ -141,7 +141,7 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     for(auto trace : g_trace_state.thread_traces) {
         trace->pause = true;
     }
-    funtrace_procmaps* procmaps = funtrace_save_procmaps();
+    funtrace_procmaps* procmaps = funtrace_get_procmaps();
     write_procmaps(procmaps);
     funtrace_free_procmaps(procmaps);
 
@@ -157,7 +157,7 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     }
 }
 
-extern "C" funtrace_procmaps* NOINSTR funtrace_save_procmaps()
+extern "C" funtrace_procmaps* NOINSTR funtrace_get_procmaps()
 {
     std::ifstream maps_file("/proc/self/maps", std::ios::binary);
     if (!maps_file.is_open()) {
@@ -181,7 +181,7 @@ struct funtrace_snapshot
     NOINSTR ~funtrace_snapshot() {}
 };
 
-funtrace_snapshot* NOINSTR funtrace_pause_and_save_snapshot()
+funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
 {
     std::lock_guard<std::mutex> guard(g_trace_state.mutex);
     for(auto trace : g_trace_state.thread_traces) {
@@ -286,4 +286,69 @@ struct register_main_thread
         g_trace_state.thread_traces.insert(&g_thread_trace);
     }
 }
-g_register_main_thread;
+g_funtrace_register_main_thread;
+
+//we register a signal handler for SIGTRAP, and have a thread waiting for the signal
+//to arrive and dumping trace data when it does. this is good for programs you don't
+//want to modify beyond rebuilding (otherwise it's not so great since you can't time
+//the event very well, but it might still be enough to get a feeling of what the program
+//is doing)
+#ifndef FUNTRACE_NO_SIGTRAP
+
+#include <thread>
+#include <atomic>
+#include <csignal>
+
+struct sigtrap_handler
+{
+    std::mutex mutex;
+    std::thread thread;
+    std::atomic<bool> quit;
+    std::atomic<bool> done;
+
+    static void NOINSTR signal_handler(int);
+    void NOINSTR thread_func();
+    NOINSTR sigtrap_handler()
+    {
+        mutex.lock();
+        quit = false;
+        done = false;
+        thread = std::thread([this] {
+            thread_func();
+        });
+        signal(SIGTRAP, signal_handler);
+    }
+    NOINSTR ~sigtrap_handler()
+    {
+        quit = true;
+        while(!done) {
+            mutex.unlock();
+        }
+        thread.join();
+    }
+}
+g_funtrace_sigtrap_handler;
+
+void NOINSTR sigtrap_handler::signal_handler(int)
+{
+    g_funtrace_sigtrap_handler.mutex.unlock();
+}
+
+void NOINSTR sigtrap_handler::thread_func()
+{
+    //remove this thread from the list of traced threads
+    {
+        std::lock_guard<std::mutex> guard(g_trace_state.mutex);
+        g_trace_state.thread_traces.erase(&g_thread_trace);
+    }
+    while(true) {
+        mutex.lock();
+        if(quit) {
+            done = true;
+            break;
+        }
+        funtrace_pause_and_write_current_snapshot();
+    }
+}
+
+#endif //FUNTRACE_NO_SIGTRAP
