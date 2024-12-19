@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use procaddr2sym::{ProcAddr2Sym, SymInfo};
 use serde_json::Value;
 use clap::Parser;
+use std::cmp::max;
 
 const RETURN_BIT: i32 = 63;
 const MAGIC_LEN: usize = 8;
@@ -21,19 +22,117 @@ struct FunTraceEntry {
     cycle: u64,
 }
 
-fn start_json(mut json: &File) -> io::Result<()> {
-    json.write(br#"{
-"traceEvents": [
-"#)?;
-    Ok(())
-}
-
 struct SourceCode {
     json_str: String,
     num_lines: usize,
 }
 
-fn finish_json(mut json: &File, source_cache: &HashMap<String, SourceCode>, funcset: &mut HashSet<SymInfo>) -> io::Result<()> {
+fn oldest_event(sample_entries: &Vec<Vec<FunTraceEntry>>, max_event_age: &Option<u64>) -> Option<u64> {
+    if let Some(max_age) = max_event_age {
+        let mut youngest = 0;
+        for entries in sample_entries {
+            for entry in entries {
+                youngest = max(entry.cycle, youngest);
+            }
+        }
+        Some(youngest - max_age)
+    }
+    else {
+        None
+    }
+}
+
+fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>, procaddr2sym: &mut ProcAddr2Sym, source_cache: &mut HashMap<String, SourceCode>, sym_cache: &mut HashMap<u64, SymInfo>, max_event_age: &Option<u64>) -> io::Result<()> {
+    let mut json = File::create(fname)?;
+    json.write(br#"{
+"traceEvents": [
+"#)?;
+    println!("decoding a trace sample into {}...", fname);
+    let mut tid = 1;
+
+    // we list the set of functions (to tell their file, line pair to vizviewer);
+    // we also use this set to only dump the relevant part of the source cache to each
+    // json (the source cache persists across samples/jsons but not all files are relevant
+    // to all samples)
+    let mut funcset: HashSet<SymInfo> = HashSet::new();
+    let mut first_event = true;
+
+    let oldest = oldest_event(sample_entries, max_event_age);
+
+    for entries in sample_entries {
+        let mut stack: Vec<FunTraceEntry> = Vec::new();
+        let mut num_events = 0;
+        let mut earliest_cycle = entries[0].cycle;
+        if let Some(oldest_cycle) = oldest {
+            earliest_cycle = max(earliest_cycle, oldest_cycle);
+        } 
+        let latest_cycle = entries[entries.len()-1].cycle;
+        let mut num_orphan_returns = 0;
+
+        for entry in entries {
+            if let Some(oldest_cycle) = oldest {
+                if oldest_cycle > entry.cycle {
+                    continue; //ignore old events
+                }
+            }
+            let ret = entry.address >> RETURN_BIT;
+            let addr = entry.address & !(1<<RETURN_BIT);
+            if !sym_cache.contains_key(&addr) {
+                sym_cache.insert(addr, procaddr2sym.proc_addr2sym(addr));
+            }
+            if ret == 0 {
+                // call
+                stack.push(*entry);
+            }
+            else {
+                //write an event to json
+                let (call_cycle, call_addr) = if stack.is_empty() {
+                    num_orphan_returns += 1;
+                    // a return without a call - the call event must have been overwritten
+                    // in the cyclic trace buffer; fake a call at the start of the trace
+                    //
+                    // the "-num_orphan_returns" is here because vizviewer / Perfetto is
+                    // thrown off by multiple calls starting at the same cycle and puts
+                    // them in the wrong lane on the timeline
+                    (earliest_cycle - num_orphan_returns, addr)
+                }
+                else {
+                    let call_entry = stack.pop().unwrap();
+                    (call_entry.cycle, call_entry.address)
+                };
+                let sym = sym_cache.get(&call_addr).unwrap();
+                // the redundant ph:X is needed to render the event on Perfetto's timeline, and pid:1
+                // for vizviewer --flamegraph to work
+                json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X","pid":1}}"#, 
+                            if first_event { "" } else { "\n," },
+                            tid, call_cycle, entry.cycle-call_cycle, json_name(sym)).as_bytes())?; 
+
+                first_event = false;
+                funcset.insert(sym.clone());
+                num_events += 1;
+
+                //cache the source code if it's the first time we see this file
+                if !source_cache.contains_key(&sym.file) {
+                    let mut source_code: Vec<u8> = Vec::new();
+                    if let Ok(mut source_file) = File::open(&sym.file) {
+                        source_file.read_to_end(&mut source_code)?;
+                    }
+                    let json_str = Value::String(String::from_utf8(source_code.clone()).unwrap()).to_string();
+                    let num_lines = source_code.iter().filter(|&&b| b == b'\n').count(); //TODO: num newlines
+                    //might be off by one relatively to num lines...
+                    source_cache.insert(sym.file.clone(), SourceCode{ json_str, num_lines });
+                }
+            }
+        }
+        if latest_cycle >= earliest_cycle {
+            println!("thread {} - {} recent events logged over {} cycles", tid, num_events, latest_cycle-earliest_cycle);
+            tid += 1;
+        }
+        else {
+            println!("skipping a thread (all {} logged events are too old)", entries.len());
+        }
+    }
+
     json.write(b"],\n")?;
     // find the source files containing the functions in this sample's set
     let mut fileset: HashSet<String> = HashSet::new();
@@ -57,7 +156,6 @@ fn finish_json(mut json: &File, source_cache: &HashMap<String, SourceCode>, func
             json.write(source_code.json_str.as_bytes())?;
             json.write(b",")?;
             json.write(format!("{}", source_code.num_lines).as_bytes())?;
-            //json.write(Value::String(String::from_utf8(*source_code).unwrap()).to_string().as_bytes())?;
             json.write(if i==fileset.len()-1 { b"]\n" } else { b"],\n" })?;
         }
     }
@@ -67,11 +165,13 @@ fn finish_json(mut json: &File, source_cache: &HashMap<String, SourceCode>, func
 
     // tell where each function is defined
     for (i, sym) in funcset.iter().enumerate() {
-        json.write(format!("{}:[{},{}]{}\n", json_name(sym), Value::String(sym.file.clone()).to_string(), sym.line, if i==funcset.len()-1 { "" } else { "," }).as_bytes())?;
+        // line-3 is there to show the function prototype in vizviewer/Perfetto
+        // (often the debug info puts the line at the opening { of a function
+        // and then the prototype is not seen, it can also span a few lines)
+        json.write(format!("{}:[{},{}]{}\n", json_name(sym), Value::String(sym.file.clone()).to_string(), if sym.line <= 3 { sym.line } else { sym.line-3 }, if i==funcset.len()-1 { "" } else { "," }).as_bytes())?;
     }
     json.write(b"}}}\n")?;
 
-    funcset.clear();
     Ok(())
 }
 
@@ -87,23 +187,17 @@ fn json_name(sym: &SymInfo) -> String {
     Value::String(format!("{} ({}:{})",sym.demangled_func, sym.file, sym.line)).to_string()
 }
 
-fn parse_chunks(file_path: &String, json_basename: &String, max_cycles_in_thread: Option<u64>) -> io::Result<()> {
+fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Option<u64>) -> io::Result<()> {
     let mut file = File::open(file_path)?;
     let mut procaddr2sym = ProcAddr2Sym::new();
     let mut sym_cache: HashMap<u64, SymInfo> = HashMap::new();
 
-    let mut json_opt = None;
-    let mut num_json = 0;
-    let mut tid = 1;
-
     // we dump source code into the JSON files to make it visible in vizviewer
     let mut source_cache = HashMap::new();
-    // we also list the set of functions (to tell their file, line pair to vizviewer);
-    // we also use this set to only dump the relevant part of the source cache to each
-    // json (the source cache persists across samples/jsons but not all files are relevant
-    // to all samples)
-    let mut funcset: HashSet<SymInfo> = HashSet::new();
-    let mut first_event = true;
+
+    let mut sample_entries: Vec<Vec<FunTraceEntry>> = Vec::new();
+
+    let mut num_json = 0;
 
     loop {
         //the file consists of chunks with an 8-byte magic string telling the chunk
@@ -124,30 +218,14 @@ fn parse_chunks(file_path: &String, json_basename: &String, max_cycles_in_thread
                 println!("warning: non-zero length for {}", std::str::from_utf8(&magic).unwrap());
                 file.seek(SeekFrom::Current(chunk_length as i64))?;
             }
-            if &magic == b"FUNTRACE" {
-                match json_opt {
-                    Some(ref json) => {
-                        println!("warning: FUNTRACE block not closed");
-                        finish_json(json, &source_cache, &mut funcset)?;
-                    },
-                    _ => {}
-                }
-                let fname = format_json_filename(json_basename, num_json);
-                json_opt = Some(File::create(fname.clone())?);
-                start_json(&json_opt.as_ref().unwrap())?;
-                println!("decoding a trace sample into {}...", fname);
-                first_event = true;
-                tid = 1;
+            if &magic == b"FUNTRACE" && !sample_entries.is_empty() {
+                println!("warning: FUNTRACE block not closed by ENDTRACE");
             }
-            else {
-                match json_opt {
-                    Some(ref json) => { finish_json(&json, &source_cache, &mut funcset)?; } 
-                    _ => { println!("warning: ENDTRACE without a preceding FUNTRACE"); }
-                }
-                json_opt = None;
+            if !sample_entries.is_empty() {
+                write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age)?;
                 num_json += 1;
+                sample_entries.clear();
             }
-            continue;
         }
         else if &magic == b"PROCMAPS" {
             //the content of the dumping process's /proc/self/maps to use when
@@ -169,79 +247,15 @@ fn parse_chunks(file_path: &String, json_basename: &String, max_cycles_in_thread
             file.read_exact(bytemuck::cast_slice_mut(&mut entries))?;
 
             entries.sort_by_key(|entry| entry.cycle);
-
-            if !json_opt.is_some() {
-                println!("Ignoring a TRACEBUF chunk since it's outside a FUNTRACE ... ENDTRACE area");
-                continue;
-            }
-            let mut json = json_opt.as_ref().unwrap();
-            let mut stack: Vec<FunTraceEntry> = Vec::new();
-            let mut num_events = 0;
-            let earliest_cycle = entries[0].cycle;
-            let latest_cycle = entries[entries.len()-1].cycle;
-            let mut num_orphan_returns = 0;
-
-            if let Some(max_cycles) = max_cycles_in_thread {
-                if latest_cycle - earliest_cycle > max_cycles {
-                    println!("ignoring an 'inactive' thread which spans {} cycles (>{})", latest_cycle-earliest_cycle, max_cycles);
-                    continue;
-                }
-            }
-            
-            for entry in entries {
-                let ret = entry.address >> RETURN_BIT;
-                let addr = entry.address & !(1<<RETURN_BIT);
-                if !sym_cache.contains_key(&addr) {
-                    sym_cache.insert(addr, procaddr2sym.proc_addr2sym(addr));
-                }
-                if ret == 0 {
-                    // call
-                    stack.push(entry);
-                }
-                else {
-                    //write an event to json
-                    let call_cycle = if stack.is_empty() {
-                        num_orphan_returns += 1;
-                        // a return without a call - the call event must have been overwritten
-                        // in the cyclic trace buffer; fake a call at the start of the trace
-                        //
-                        // the "-num_orphan_returns" is here because vizviewer / Perfetto is
-                        // thrown off by multiple calls starting at the same cycle and puts
-                        // them in the wrong lane on the timeline
-                        earliest_cycle - num_orphan_returns
-                    }
-                    else {
-                        stack.pop().unwrap().cycle
-                    };
-                    let sym = sym_cache.get(&addr).unwrap();
-                    json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X"}}"#, 
-                                if first_event { "" } else { "\n," },
-                                tid, call_cycle, entry.cycle-call_cycle, json_name(sym)).as_bytes())?; 
-
-                    first_event = false;
-                    funcset.insert(sym.clone());
-                    num_events += 1;
-
-                    //cache the source code if it's the first time we see this file
-                    if !source_cache.contains_key(&sym.file) {
-                        let mut source_code: Vec<u8> = Vec::new();
-                        if let Ok(mut source_file) = File::open(&sym.file) {
-                            source_file.read_to_end(&mut source_code)?;
-                        }
-                        let json_str = Value::String(String::from_utf8(source_code.clone()).unwrap()).to_string();
-                        let num_lines = source_code.iter().filter(|&&b| b == b'\n').count(); //TODO: num newlines
-                        //might be off by one relatively to num lines...
-                        source_cache.insert(sym.file.clone(), SourceCode{ json_str, num_lines });
-                    }
-                }
-            }
-            println!("thread {} - {} events, {} cycles", tid, num_events, latest_cycle-earliest_cycle);
-
-            tid += 1;
+            sample_entries.push(entries);
         } else {
             println!("Unknown chunk type: {:?}", std::str::from_utf8(&magic).unwrap_or("<invalid>"));
             file.seek(SeekFrom::Current(chunk_length as i64))?;
         }
+    }
+    if !sample_entries.is_empty() {
+        println!("warning: FUNTRACE block not closed by ENDTRACE");
+        write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age)?;
     }
 
     Ok(())
@@ -254,32 +268,12 @@ struct Cli {
     functrace_raw: String,
     #[clap(help="basename.json, basename.1.json, basename.2.json... are created, one JSON file per trace sample")]
     out_basename: String,
-    #[clap(short, long, help="maximal number of cycles in a thread - threads with more cycles are considered inactive [active threads fill up their trace buffer in few cycles] and ignored, avoiding the appearance of a giant blank timeline in vizviewer/Perfetto")]
-    max_cycles_in_thread: Option<u64>,
     #[clap(short, long, help="ignore events older than this relatively to the latest recorded event (very old events create the appearance of a giant blank timeline in vizviewer/Perfetto which zooms out to show the recorded timeline in full)")]
-    oldest_event: Option<u64>,
+    max_event_age: Option<u64>,
 }
 
 fn main() -> io::Result<()> {
-    /*
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 && args.len() != 4 {
-        println!("Usage: {} <funtrace.raw> <basename> [max cycles in decoded thread] #basename.json, basename.1.json, basename.2.json... are created, one file per trace sample", args[0]);
-        std::process::exit(1);
-    }
-    let raw_file = &args[1];
-    let out_basename = &args[2];
-    let max_cycles_in_thread = if args.len() == 4 {
-        match args[3].parse::<u64>() {
-            Ok(cycles) => Some(cycles),
-            Err(e) => panic!("error parsing max cycles in decoded thread: {}", e)
-        }
-    }
-    else {
-        None
-    };
-    */
     let args = Cli::parse();
-    parse_chunks(&args.functrace_raw, &args.out_basename, args.max_cycles_in_thread)
+    parse_chunks(&args.functrace_raw, &args.out_basename, args.max_event_age)
 }
 

@@ -101,6 +101,15 @@ static inline void NOINSTR trace(void* ptr, uint64_t is_ret)
 extern "C" void NOINSTR __cyg_profile_func_enter(void* func, void* caller) { trace(func, 0); }
 extern "C" void NOINSTR __cyg_profile_func_exit(void* func, void* caller) { trace(func, 1); }
 
+/*
+extern "C" void NOINSTR __fentry__() {
+    trace(__builtin_return_address(0),0);
+}
+extern "C" void NOINSTR __return__() { 
+trace(__builtin_return_address(0),1); 
+}
+*/
+
 struct funtrace_procmaps
 {
     std::vector<char> data;
@@ -110,18 +119,16 @@ struct funtrace_procmaps
 
 const int MAGIC_LEN = 8;
 
-static void NOINSTR write_procmaps(funtrace_procmaps* procmaps)
+static void NOINSTR write_procmaps(std::ostream& file, funtrace_procmaps* procmaps)
 {
-    std::ostream& file = g_trace_state.file();
     file.write("PROCMAPS", MAGIC_LEN);
     uint64_t size = procmaps->data.size();
     file.write((char*)&size, sizeof size);
     file.write(&procmaps->data[0], size);
 }
 
-static void NOINSTR write_tracebufs(const std::set<trace_data*>& thread_traces)
+static void NOINSTR write_tracebufs(std::ostream& file, const std::set<trace_data*>& thread_traces)
 {
-    std::ostream& file = g_trace_state.file();
     char zero[sizeof(uint64_t)] = {0};
     file.write("FUNTRACE", MAGIC_LEN);
     file.write(zero, sizeof zero);
@@ -141,8 +148,9 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     for(auto trace : g_trace_state.thread_traces) {
         trace->pause = true;
     }
+    std::ostream& file = g_trace_state.file();
     funtrace_procmaps* procmaps = funtrace_get_procmaps();
-    write_procmaps(procmaps);
+    write_procmaps(file, procmaps);
     funtrace_free_procmaps(procmaps);
 
     //we don't allocate a snapshot - we save the memory for this by writing
@@ -150,11 +158,13 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     //for more time)
     //
     //(we didn't mind briefly allocating procmaps because it's very little data)
-    write_tracebufs(g_trace_state.thread_traces);
+    write_tracebufs(file, g_trace_state.thread_traces);
 
     for(auto trace : g_trace_state.thread_traces) {
         trace->pause = false;
     }
+
+    file.flush();
 }
 
 extern "C" funtrace_procmaps* NOINSTR funtrace_get_procmaps()
@@ -214,8 +224,8 @@ void NOINSTR funtrace_free_snapshot(funtrace_snapshot* snapshot)
 void NOINSTR funtrace_write_saved_snapshot(const char* filename, funtrace_procmaps* procmaps, funtrace_snapshot* snapshot)
 {
     std::ofstream file(filename);
-    write_procmaps(procmaps);
-    write_tracebufs(snapshot->thread_traces);
+    write_procmaps(file, procmaps);
+    write_tracebufs(file, snapshot->thread_traces);
 }
 
 // we interpose pthread_create in order to implement the thing that having
