@@ -1,0 +1,23 @@
+#!/usr/bin/python3
+import sys
+import os
+import subprocess
+linking = '-c' not in sys.argv and '-S' not in sys.argv and '-E' not in sys.argv
+args = sys.argv[1:]
+
+# change -finstrument-functions-exclude-file-list to suit your needs - this is just a sensible default
+# (ofc you don't need to use a compiler wrapper at all; this is just potentially easier than properly
+# integrating with the build system on first try. more so with -pg than with -finstrument-functions
+# because the latter will have problems with an "undefined __return__" function every time gcc is invoked
+# with -minstrument-return=call but without funtrace_pg.S...)
+args += "-g -pthread -finstrument-functions -finstrument-functions-exclude-file-list=.h,.hpp,/usr/include".split()
+
+if linking:
+    is_shared = '-shared' in args
+    if not is_shared: # don't link the runtime into .so's - only into the executables using them
+        srcdir = os.path.dirname(os.path.dirname(__file__))
+        args += [os.path.join(srcdir, f) for f in ['funtrace.cpp']]
+    args += ['-ldl']
+
+gxxpath = subprocess.getoutput('which g++')
+os.execl(gxxpath, *([gxxpath] + args))

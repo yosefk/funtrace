@@ -3,35 +3,39 @@
 #include <thread>
 #define NL __attribute__((noinline))
 
-volatile int x;
+volatile char x[64*3];
 
-NL void f()
+NL void f(int index)
 {
     inlined();
-    x = 5;
+    x[index] = 5;
 }
 
-void g()
+void g(int i)
 {
-    f();
+    f(i);
 }
 
-void h() {
-    g();
-    g();
+void h(int i) {
+    g(i);
+    g(i);
 }
 volatile int done = 0;
+
+void shared_g(int a1, int a2, int a3, int a4, int a5, int a6);
+
 int main()
 {
     int iter = 0;
 //    funtrace_save_maps();
     std::thread t([]{
             while(!done) {
-                h();
+                h(64);
             }
     });
     while(1) {
-        g();
+        g(128);
+        shared_g(1,2,3,4,5,6);
         iter++;
         if(iter == 100000) {
             funtrace_pause_and_write_current_snapshot();

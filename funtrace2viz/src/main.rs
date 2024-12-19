@@ -125,11 +125,11 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
             }
         }
         if latest_cycle >= earliest_cycle {
-            println!("thread {} - {} recent events logged over {} cycles", tid, num_events, latest_cycle-earliest_cycle);
+            println!("  thread {} - {} recent events logged over {} cycles", tid, num_events, latest_cycle-earliest_cycle);
             tid += 1;
         }
         else {
-            println!("skipping a thread (all {} logged events are too old)", entries.len());
+            println!("    skipping a thread (all {} logged events are too old)", entries.len()/2);
         }
     }
 
