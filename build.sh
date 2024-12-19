@@ -9,4 +9,4 @@ CXXFLAGS="-O3 -g -std=c++11 -mfentry -minstrument-return=call -pg -Wall -pthread
 g++ -c test.cpp $CXXFLAGS
 g++ -c funtrace.cpp $CXXFLAGS
 g++ -S funtrace.cpp $CXXFLAGS
-g++ -o test_trace test.o funtrace.o -ldl -pthread funtrace_pg.s
+g++ -o test_trace test.o funtrace.o -ldl -pthread funtrace_pg.S
