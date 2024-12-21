@@ -27,27 +27,39 @@ struct SourceCode {
     num_lines: usize,
 }
 
-fn oldest_event(sample_entries: &Vec<Vec<FunTraceEntry>>, max_event_age: &Option<u64>) -> Option<u64> {
+fn oldest_event(sample_entries: &Vec<Vec<FunTraceEntry>>, max_event_age: &Option<u64>, oldest_event_time: &Option<u64>, threads: &Vec<u32>) -> Option<u64> {
     if let Some(max_age) = max_event_age {
         let mut youngest = 0;
+        let mut tid = 1;
         for entries in sample_entries {
-            for entry in entries {
-                youngest = max(entry.cycle, youngest);
+            if threads.is_empty() || threads.contains(&tid) {
+                for entry in entries {
+                    youngest = max(entry.cycle, youngest);
+                }
             }
+            tid += 1;
         }
         Some(youngest - max_age)
+    }
+    else if let Some(oldest) = oldest_event_time {
+        Some(*oldest)
     }
     else {
         None
     }
 }
 
-fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>, procaddr2sym: &mut ProcAddr2Sym, source_cache: &mut HashMap<String, SourceCode>, sym_cache: &mut HashMap<u64, SymInfo>, max_event_age: &Option<u64>) -> io::Result<()> {
-    let mut json = File::create(fname)?;
-    json.write(br#"{
+fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>, procaddr2sym: &mut ProcAddr2Sym, source_cache: &mut HashMap<String, SourceCode>, sym_cache: &mut HashMap<u64, SymInfo>, max_event_age: &Option<u64>, oldest_event_time: &Option<u64>, dry: bool, threads: &Vec<u32>) -> io::Result<()> {
+    let mut json = if dry { File::open("/dev/null")? } else { File::create(fname)? };
+    if !dry {
+        json.write(br#"{
 "traceEvents": [
 "#)?;
-    println!("decoding a trace sample into {}...", fname);
+        println!("decoding a trace sample into {}...", fname);
+    }
+    else {
+        println!("inspecting sample {} (without creating the file...)", fname);
+    }
     let mut tid = 1;
 
     // we list the set of functions (to tell their file, line pair to vizviewer);
@@ -57,9 +69,14 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
     let mut funcset: HashSet<SymInfo> = HashSet::new();
     let mut first_event = true;
 
-    let oldest = oldest_event(sample_entries, max_event_age);
+    let oldest = oldest_event(sample_entries, max_event_age, oldest_event_time, threads);
 
     for entries in sample_entries {
+        if !threads.is_empty() && !threads.contains(&tid) {
+            println!("ignoring thread {} - not on the list {:?}", tid, threads);
+            tid += 1;
+            continue;
+        }
         let mut stack: Vec<FunTraceEntry> = Vec::new();
         let mut num_events = 0;
         let mut earliest_cycle = entries[0].cycle;
@@ -77,7 +94,7 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
             }
             let ret = entry.address >> RETURN_BIT;
             let addr = entry.address & !(1<<RETURN_BIT);
-            if !sym_cache.contains_key(&addr) {
+            if !dry && !sym_cache.contains_key(&addr) {
                 sym_cache.insert(addr, procaddr2sym.proc_addr2sym(addr));
             }
             if ret == 0 {
@@ -100,6 +117,10 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
                     let call_entry = stack.pop().unwrap();
                     (call_entry.cycle, call_entry.address)
                 };
+                num_events += 1;
+                if dry {
+                    continue;
+                }
                 let sym = sym_cache.get(&call_addr).unwrap();
                 // the redundant ph:X is needed to render the event on Perfetto's timeline, and pid:1
                 // for vizviewer --flamegraph to work
@@ -109,7 +130,6 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
 
                 first_event = false;
                 funcset.insert(sym.clone());
-                num_events += 1;
 
                 //cache the source code if it's the first time we see this file
                 if !source_cache.contains_key(&sym.file) {
@@ -125,12 +145,15 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
             }
         }
         if latest_cycle >= earliest_cycle {
-            println!("  thread {} - {} recent events logged over {} cycles", tid, num_events, latest_cycle-earliest_cycle);
+            println!("  thread {} - {} recent function calls logged over {} cycles [{} - {}]", tid, num_events, latest_cycle-earliest_cycle, earliest_cycle, latest_cycle);
             tid += 1;
         }
         else {
-            println!("    skipping a thread (all {} logged events are too old)", entries.len()/2);
+            println!("    skipping a thread (all {} logged function entry/return events are too old)", entries.len());
         }
+    }
+    if dry {
+        return Ok(())
     }
 
     json.write(b"],\n")?;
@@ -187,7 +210,7 @@ fn json_name(sym: &SymInfo) -> String {
     Value::String(format!("{} ({}:{})",sym.demangled_func, sym.file, sym.line)).to_string()
 }
 
-fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Option<u64>) -> io::Result<()> {
+fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Option<u64>, oldest_event_time: Option<u64>, dry: bool, samples: &Vec<u32>, threads: &Vec<u32>) -> io::Result<()> {
     let mut file = File::open(file_path)?;
     let mut procaddr2sym = ProcAddr2Sym::new();
     let mut sym_cache: HashMap<u64, SymInfo> = HashMap::new();
@@ -222,7 +245,12 @@ fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Optio
                 println!("warning: FUNTRACE block not closed by ENDTRACE");
             }
             if !sample_entries.is_empty() {
-                write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age)?;
+                if samples.is_empty() || samples.contains(&num_json) {
+                    write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age, &oldest_event_time, dry, &threads)?;
+                }
+                else {
+                    println!("ignoring sample {} - not on the list {:?}", num_json, samples);
+                }
                 num_json += 1;
                 sample_entries.clear();
             }
@@ -245,9 +273,11 @@ fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Optio
             let num_entries = chunk_length / mem::size_of::<FunTraceEntry>();
             let mut entries = vec![FunTraceEntry { address: 0, cycle: 0 }; num_entries];
             file.read_exact(bytemuck::cast_slice_mut(&mut entries))?;
-
-            entries.sort_by_key(|entry| entry.cycle);
-            sample_entries.push(entries);
+            entries.retain(|&entry| !(entry.cycle == 0 && entry.address == 0));
+            if !entries.is_empty() {
+                entries.sort_by_key(|entry| entry.cycle);
+                sample_entries.push(entries);
+            }
         } else {
             println!("Unknown chunk type: {:?}", std::str::from_utf8(&magic).unwrap_or("<invalid>"));
             file.seek(SeekFrom::Current(chunk_length as i64))?;
@@ -255,7 +285,7 @@ fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Optio
     }
     if !sample_entries.is_empty() {
         println!("warning: FUNTRACE block not closed by ENDTRACE");
-        write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age)?;
+        write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age, &oldest_event_time, dry, &threads)?;
     }
 
     Ok(())
@@ -270,10 +300,21 @@ struct Cli {
     out_basename: String,
     #[clap(short, long, help="ignore events older than this relatively to the latest recorded event (very old events create the appearance of a giant blank timeline in vizviewer/Perfetto which zooms out to show the recorded timeline in full)")]
     max_event_age: Option<u64>,
+    #[clap(short, long, help="ignore events older than this cycle (like --max-event-age but as a timestamp instead of an age)")]
+    oldest_event_time: Option<u64>,
+    #[clap(short, long, help="dry run - only list the samples & threads with basic stats, don't decode into JSON")]
+    dry: bool,
+    #[clap(short, long, help="ignore samples with the indexes outside this list")]
+    samples: Vec<u32>,
+    #[clap(short, long, help="ignore threads with the indexes outside this list (including for the purpose of interpreting --max-event-age)")]
+    threads: Vec<u32>,
 }
 
 fn main() -> io::Result<()> {
     let args = Cli::parse();
-    parse_chunks(&args.functrace_raw, &args.out_basename, args.max_event_age)
+    if args.max_event_age.is_some() && args.oldest_event_time.is_some() {
+        panic!("both --max-event-age and --oldest-event-time specified - choose one");
+    }
+    parse_chunks(&args.functrace_raw, &args.out_basename, args.max_event_age, args.oldest_event_time, args.dry, &args.samples, &args.threads)
 }
 

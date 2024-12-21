@@ -6,10 +6,11 @@
  *   for instance, for keeping a trace corresponding to the slowest observed
  *   handling of every kind of event (so you throw out this trace and replace it
  *   with a new one every time you observe an even slower event), and writing
- *   it out upon request or when the program terminates.
+ *   it all out upon request or when the program terminates.
  *
- * - by writing to the funtrace.raw file (which is only opened if you use
- *   the respective functions). this is good if you detect moments of peak
+ * - by writing to the funtrace.raw file (which is only opened if you call
+ *   funtrace_pause_and_write_current_snapshot() or use `kill -SIGTRAP` on
+ *   the process). this is good if you detect moments of peak
  *   load and want to write the data out immediately, without wasting memory
  *   for keeping the trace data beyond the cyclic buffers already allocated
  *   to collect the trace in the first place (the data is written out
@@ -21,13 +22,14 @@
  */
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* to "just append the current trace snapshot to funtrace.raw", all you need
-   is this function; it doesn't block the calling thread - there's a worker
-   thread for it, which is also used to write out traces to funtrace.raw upon SIGTRAP.
+   is this function
 
    this method writes the current procmaps together with
    the trace data (which, strictly speaking, is potentially incorrect because
@@ -48,15 +50,31 @@ void funtrace_pause_and_write_current_snapshot();
 struct funtrace_procmaps;
 struct funtrace_snapshot;
 
+/* you want to call this every time code might get loaded to new addresses;
+   you can then save the procmaps corresponding to each snapshot using
+   funtrace_write_saved_snapshot() */
 struct funtrace_procmaps* funtrace_get_procmaps();
 /* a snapshot has the size FUNTRACE_BUF_SIZE times the number of threads alive
    at the time when it's taken. threads can't be created and can't terminate
    until the trace data is copied into the snapshot */
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot();
+/* you might also want to only get the data up to a certain age,
+   both to save time & space and to get "the part you want" (like from the
+   start of handling some event till the end) */
+//TODO
+uint64_t funtrace_time(); /* timestamp from the same source used for tracing */
+struct funtrace_snapshot* funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time);
+struct funtrace_snapshot* funtrace_pause_and_get_snapshot_up_to_age(uint64_t max_event_age);
 void funtrace_free_procmaps(struct funtrace_procmaps* procmaps);
 void funtrace_free_snapshot(struct funtrace_snapshot* snapshot);
 
+/* writing out a sample into its own file after it was obtained with funtrace_pause_and_get_snapshot()
+   does not interfere with threads starting and terminating */
 void funtrace_write_saved_snapshot(const char* filename, struct funtrace_procmaps* procmaps, struct funtrace_snapshot* snapshot);
+
+//TODO:
+/* this is useful to save memory for the event buffer in threads you don't want to trace. */
+void funtrace_ignore_this_thread();
 
 #ifdef __cplusplus
 }

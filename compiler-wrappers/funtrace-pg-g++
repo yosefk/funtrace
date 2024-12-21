@@ -11,6 +11,9 @@ if linking:
     if not is_shared: # don't link the runtime into .so's - only into the executables using them
         srcdir = os.path.dirname(os.path.dirname(__file__))
         args += [os.path.join(srcdir, f) for f in ['funtrace.cpp', 'funtrace_pg.S']]
+    else:
+        # remove no-undefined - __return__ will be undefined in shared objects
+        args = [a for a in args if a != '-Wl,--no-undefined']
     args += ['-ldl']
     # note that we don't pass -pg when linking (and therefore the -mfentry and -minstrument-return-call
     # flags which do nothing without -pg.) this is to avoid the generation of gmon.out. the downside

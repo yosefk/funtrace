@@ -24,6 +24,11 @@
 //put NOINSTR on them...
 #define NOINSTR __attribute__((no_instrument_function))
 
+const int funtrace_buf_size = FUNTRACE_BUF_SIZE; //for debug info
+//(#define macros aren't visible with plain -g and need fancier flags that most
+//build systems don't pass; and FUNTRACE_BUF_SIZE must be a #define
+//to be useable from funtrace_pg.s)
+
 //if you modify this, update funtrace_pg.S as well
 struct trace_entry
 {
@@ -101,8 +106,8 @@ inline void NOINSTR trace_data::trace(void* ptr, uint64_t is_ret)
 
 thread_local trace_data g_thread_trace;
 
-extern "C" void NOINSTR __cyg_profile_func_enter(void* func, void* caller) { g_thread_trace.trace(func, 0); }
-extern "C" void NOINSTR __cyg_profile_func_exit(void* func, void* caller) { g_thread_trace.trace(func, 1); }
+extern "C" void NOINSTR __cyg_profile_func_enter(void* func, void*) { g_thread_trace.trace(func, 0); }
+extern "C" void NOINSTR __cyg_profile_func_exit(void* func, void*) { g_thread_trace.trace(func, 1); }
 
 //funtrace_pg.S is based on assembly generated from these C functions, massaged
 //to avoid clobbering the registers where arguments might have been passed to
