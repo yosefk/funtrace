@@ -7,6 +7,9 @@
 #include <vector>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <algorithm>
+#include <cstring>
+#include <cassert>
 #include "funtrace.h"
 #include "funtrace_buf_size.h"
 
@@ -189,16 +192,21 @@ static void NOINSTR write_procmaps(std::ostream& file, funtrace_procmaps* procma
     file.write(&procmaps->data[0], size);
 }
 
-static void NOINSTR write_tracebufs(std::ostream& file, const std::vector<trace_data*>& thread_traces)
+struct event_buffer
+{
+    trace_entry* buf;
+    uint64_t bytes;
+};
+
+static void NOINSTR write_tracebufs(std::ostream& file, const std::vector<event_buffer>& thread_traces)
 {
     char zero[sizeof(uint64_t)] = {0};
     file.write("FUNTRACE", MAGIC_LEN);
     file.write(zero, sizeof zero);
     for(auto trace : thread_traces) {
         file.write("TRACEBUF", MAGIC_LEN);
-        uint64_t size = FUNTRACE_BUF_SIZE;
-        file.write((char*)&size, sizeof size);
-        file.write((char*)trace->buf, size);
+        file.write((char*)&trace.bytes, sizeof trace.bytes);
+        file.write((char*)trace.buf, trace.bytes);
     }
     file.write("ENDTRACE", MAGIC_LEN);
     file.write(zero, sizeof zero);
@@ -221,7 +229,11 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     //for more time)
     //
     //(we didn't mind briefly allocating procmaps because it's very little data)
-    write_tracebufs(file, g_trace_state.thread_traces);
+    std::vector<event_buffer> traces;
+    for(auto trace : g_trace_state.thread_traces) {
+        traces.push_back(event_buffer{trace->buf, FUNTRACE_BUF_SIZE});
+    }
+    write_tracebufs(file, traces);
 
     for(auto trace : g_trace_state.thread_traces) {
         trace->resume_tracing();
@@ -249,7 +261,7 @@ extern "C" funtrace_procmaps* NOINSTR funtrace_get_procmaps()
 
 struct funtrace_snapshot
 {
-    std::vector<trace_data*> thread_traces;
+    std::vector<event_buffer> thread_traces;
     NOINSTR funtrace_snapshot() {}
     NOINSTR ~funtrace_snapshot() {}
 };
@@ -262,8 +274,9 @@ funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
     }
     funtrace_snapshot* snapshot = new funtrace_snapshot;
     for(auto trace : g_trace_state.thread_traces) {
-        trace_data* copy = new trace_data(*trace);
-        snapshot->thread_traces.push_back(copy);
+        trace_entry* copy = (trace_entry*)new char[FUNTRACE_BUF_SIZE];
+        memcpy(copy, trace->buf, FUNTRACE_BUF_SIZE);
+        snapshot->thread_traces.push_back(event_buffer{copy, FUNTRACE_BUF_SIZE});
     }
     for(auto trace : g_trace_state.thread_traces) {
         trace->resume_tracing();
@@ -271,24 +284,125 @@ funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
     return snapshot;
 }
 
-void NOINSTR funtrace_free_procmaps(funtrace_procmaps* procmaps)
+extern "C" void NOINSTR funtrace_free_procmaps(funtrace_procmaps* procmaps)
 {
     delete procmaps;
 }
 
-void NOINSTR funtrace_free_snapshot(funtrace_snapshot* snapshot)
+extern "C" void NOINSTR funtrace_free_snapshot(funtrace_snapshot* snapshot)
 {
     for(auto trace : snapshot->thread_traces) {
-        delete trace;
+        delete [] (char*)trace.buf;
     }
     delete snapshot;
 }
 
-void NOINSTR funtrace_write_saved_snapshot(const char* filename, funtrace_procmaps* procmaps, funtrace_snapshot* snapshot)
+extern "C" void NOINSTR funtrace_write_saved_snapshot(const char* filename, funtrace_procmaps* procmaps, funtrace_snapshot* snapshot)
 {
     std::ofstream file(filename);
     write_procmaps(file, procmaps);
     write_tracebufs(file, snapshot->thread_traces);
+}
+
+extern "C" uint64_t NOINSTR funtrace_time()
+{
+    return __rdtsc();
+}
+
+static trace_entry* find_earliest_event_after(trace_entry* begin, trace_entry* end, uint64_t time_threshold, uint64_t pause_time)
+{
+    trace_entry e;
+    e.cycle = time_threshold;
+    trace_entry* p = std::lower_bound(begin, end, e, [=](const trace_entry& e1, const trace_entry& e2) {
+        //treat events recorded later than pause_time as ordered _before_ the rest.
+        //that's because we're passing this function ranges of events logged in the order of time
+        //(so sorted by time), but they can potentially be overwritten at the beginning by events
+        //recorded after we paused tracing (because we don't have a mechanism to wait for the actual pause
+        //to take effect and threads can take time to notice the write to their pause flag.)
+        //
+        //so if binary search finds an event ordered after the pause time, it should look to its right,
+        //and the array can be thought of as "events after pause time from oldest to newest followed
+        //by "events before pause time from oldest to newest."
+        //
+        //note that we could avoid all this by a simple linear search from the pos pointer backwards,
+        //but it's slower than a binary search finding the exact earliest event followed by memcpy
+        //into an array of the correctly allocated size
+        //
+        //also note that strictly speaking, since the buffers are written by the traced threads
+        //and read by a snapshotting thread, we could theoretically see stale data in the buffer
+        //s.t. the entries would not be sorted. I think this will result in very few events being
+        //lost on very rare occasions but maybe there's a pathology where find_earliest_event_after()
+        //misses most of the relevant entries because of this with reasonably high likelihood.
+        if(e1.cycle > pause_time && e2.cycle <= pause_time) {
+            return true; //events after pause time are ordered before events before pause time
+        }
+        if(e2.cycle > pause_time && e1.cycle <= pause_time) {
+            return false;
+        }
+        return e1.cycle < e2.cycle;
+    });
+    return p==end ? nullptr : p;
+}
+
+extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time)
+{
+    std::lock_guard<std::mutex> guard(g_trace_state.mutex);
+    for(auto trace : g_trace_state.thread_traces) {
+        trace->pause_tracing();
+    }
+    funtrace_snapshot* snapshot = new funtrace_snapshot;
+    uint64_t pause_time = funtrace_time();
+    for(auto trace : g_trace_state.thread_traces) {
+        trace_entry* pos = trace->pos;
+        trace_entry* buf = trace->buf;
+        trace_entry* end = buf + FUNTRACE_BUF_SIZE/sizeof(trace_entry);
+        trace_entry* earliest_right = find_earliest_event_after(pos, end, time, pause_time);
+        trace_entry* earliest_left = find_earliest_event_after(buf, pos, time, pause_time);
+        uint64_t entries = (earliest_left ? pos-earliest_left : 0) + (earliest_right ? end-earliest_right : 0);
+        trace_entry* copy = (trace_entry*)new char[entries*sizeof(trace_entry)];
+        trace_entry* copy_to = copy;
+        //we don't really care if the events in the output are sorted but the ones to the right of pos, if we have any,
+        //would be the earlier ones
+        if(earliest_right) {
+            copy_to = std::copy(earliest_right, end, copy_to);
+        }
+        if(earliest_left) {
+            copy_to = std::copy(earliest_left, pos, copy_to);
+        }
+        assert(uint64_t(copy_to - copy) == entries);
+        snapshot->thread_traces.push_back(event_buffer{copy, entries*sizeof(trace_entry)});
+    }
+    for(auto trace : g_trace_state.thread_traces) {
+        trace->resume_tracing();
+    }
+    return snapshot;
+}
+
+extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_up_to_age(uint64_t max_event_age)
+{
+    return funtrace_pause_and_get_snapshot_starting_at_time(funtrace_time() - max_event_age);
+}
+
+void NOINSTR funtrace_ignore_this_thread()
+{
+    g_trace_state.unregister_this_thread();
+    g_thread_trace.free();
+}
+
+void funtrace_disable_tracing()
+{
+    std::lock_guard<std::mutex> guard(g_trace_state.mutex);
+    for(auto trace : g_trace_state.thread_traces) {
+        trace->pause_tracing();
+    }
+}
+
+void funtrace_enable_tracing()
+{
+    std::lock_guard<std::mutex> guard(g_trace_state.mutex);
+    for(auto trace : g_trace_state.thread_traces) {
+        trace->resume_tracing();
+    }
 }
 
 // we interpose pthread_create in order to implement the thing that having
@@ -414,7 +528,7 @@ void NOINSTR sigtrap_handler::signal_handler(int)
 void NOINSTR sigtrap_handler::thread_func()
 {
     //we don't want to trace the SIGTRAP-handling thread
-    g_trace_state.unregister_this_thread();
+    funtrace_ignore_this_thread();
     while(true) {
         mutex.lock();
         if(quit) {

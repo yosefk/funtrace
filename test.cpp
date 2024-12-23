@@ -33,15 +33,19 @@ int main()
                 h(64);
             }
     });
+    uint64_t time=0;
+    funtrace_procmaps* maps = funtrace_get_procmaps();
     while(1) {
         g(128);
         shared_g(1,2,3,4,5,6);
         iter++;
         if(iter == 100000) {
             funtrace_pause_and_write_current_snapshot();
+            time = funtrace_time();
         }
-        if(iter == 200000) {
-            funtrace_pause_and_write_current_snapshot();
+        if(iter == 100100) {
+            funtrace_snapshot* snapshot = funtrace_pause_and_get_snapshot_starting_at_time(time);
+            funtrace_write_saved_snapshot("funtrace-100-iter.raw", maps, snapshot);
             break;
         }
     }

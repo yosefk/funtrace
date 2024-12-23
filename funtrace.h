@@ -61,7 +61,6 @@ struct funtrace_snapshot* funtrace_pause_and_get_snapshot();
 /* you might also want to only get the data up to a certain age,
    both to save time & space and to get "the part you want" (like from the
    start of handling some event till the end) */
-//TODO
 uint64_t funtrace_time(); /* timestamp from the same source used for tracing */
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time);
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot_up_to_age(uint64_t max_event_age);
@@ -72,9 +71,17 @@ void funtrace_free_snapshot(struct funtrace_snapshot* snapshot);
    does not interfere with threads starting and terminating */
 void funtrace_write_saved_snapshot(const char* filename, struct funtrace_procmaps* procmaps, struct funtrace_snapshot* snapshot);
 
-//TODO:
-/* this is useful to save memory for the event buffer in threads you don't want to trace. */
+/* this is useful to save memory for the event buffer in threads you don't want to trace,
+   and also to save some but not all of the function call overhead due to being compiled
+   with tracing enabled */
 void funtrace_ignore_this_thread();
+
+/* disabling tracing will speed things up slightly. note that we don't
+   free the buffers when disabling tracing and don't reallocate them
+   when enabling tracing. funtrace_ignore_this_thread() is how you free
+   the buffer of a thread. */
+void funtrace_disable_tracing();
+void funtrace_enable_tracing();
 
 #ifdef __cplusplus
 }
