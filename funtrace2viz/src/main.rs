@@ -49,7 +49,7 @@ fn oldest_event(sample_entries: &Vec<Vec<FunTraceEntry>>, max_event_age: &Option
     }
 }
 
-fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>, procaddr2sym: &mut ProcAddr2Sym, source_cache: &mut HashMap<String, SourceCode>, sym_cache: &mut HashMap<u64, SymInfo>, max_event_age: &Option<u64>, oldest_event_time: &Option<u64>, dry: bool, threads: &Vec<u32>) -> io::Result<()> {
+fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>, procaddr2sym: &mut ProcAddr2Sym, source_cache: &mut HashMap<String, SourceCode>, sym_cache: &mut HashMap<u64, SymInfo>, max_event_age: &Option<u64>, oldest_event_time: &Option<u64>, dry: bool, threads: &Vec<u32>, cpu_freq: u64) -> io::Result<()> {
     let mut json = if dry { File::open("/dev/null")? } else { File::create(fname)? };
     if !dry {
         json.write(br#"{
@@ -70,6 +70,8 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
     let mut first_event = true;
 
     let oldest = oldest_event(sample_entries, max_event_age, oldest_event_time, threads);
+
+    let cycles_per_us = cpu_freq as f64 / 1000000.0;
 
     for entries in sample_entries {
         if !threads.is_empty() && !threads.contains(&tid) {
@@ -124,9 +126,9 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
                 let sym = sym_cache.get(&call_addr).unwrap();
                 // the redundant ph:X is needed to render the event on Perfetto's timeline, and pid:1
                 // for vizviewer --flamegraph to work
-                json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X","pid":1}}"#, 
+                json.write(format!(r#"{}{{"tid":{},"ts":{:.4},"dur":{:.4},"name":{},"ph":"X","pid":1}}"#, 
                             if first_event { "" } else { "\n," },
-                            tid, call_cycle, entry.cycle-call_cycle, json_name(sym)).as_bytes())?; 
+                            tid, call_cycle as f64/cycles_per_us, (entry.cycle-call_cycle) as f64/cycles_per_us, json_name(sym)).as_bytes())?; 
 
                 first_event = false;
                 funcset.insert(sym.clone());
@@ -221,6 +223,7 @@ fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Optio
     let mut sample_entries: Vec<Vec<FunTraceEntry>> = Vec::new();
 
     let mut num_json = 0;
+    let mut cpu_freq = 0;
 
     loop {
         //the file consists of chunks with an 8-byte magic string telling the chunk
@@ -234,19 +237,25 @@ fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Optio
         file.read_exact(&mut length_bytes)?;
         let chunk_length = usize::from_ne_bytes(length_bytes);
 
-        if &magic == b"FUNTRACE" || &magic == b"ENDTRACE" {
-            //these are empty chunks telling where the trace buffers of a single trace
-            //sample start / end
-            if chunk_length != 0 {
-                println!("warning: non-zero length for {}", std::str::from_utf8(&magic).unwrap());
+        if &magic == b"FUNTRACE" {
+            if chunk_length != 8 {
+                println!("warning: unexpected length {} for FUNTRACE chunk", chunk_length);
                 file.seek(SeekFrom::Current(chunk_length as i64))?;
+                continue;
             }
-            if &magic == b"FUNTRACE" && !sample_entries.is_empty() {
-                println!("warning: FUNTRACE block not closed by ENDTRACE");
+            let mut freq_bytes = [0u8; 8];
+            file.read_exact(&mut freq_bytes)?;
+            cpu_freq = u64::from_ne_bytes(freq_bytes);
+        }
+        else if &magic == b"ENDTRACE" {
+            if chunk_length != 0 {
+                println!("warning: non-zero length for ENDTRACE chunk");
+                file.seek(SeekFrom::Current(chunk_length as i64))?;
+                continue;
             }
             if !sample_entries.is_empty() {
                 if samples.is_empty() || samples.contains(&num_json) {
-                    write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age, &oldest_event_time, dry, &threads)?;
+                    write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age, &oldest_event_time, dry, &threads, cpu_freq)?;
                 }
                 else {
                     println!("ignoring sample {} - not on the list {:?}", num_json, samples);
@@ -285,7 +294,7 @@ fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Optio
     }
     if !sample_entries.is_empty() {
         println!("warning: FUNTRACE block not closed by ENDTRACE");
-        write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age, &oldest_event_time, dry, &threads)?;
+        write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &mut procaddr2sym, &mut source_cache, &mut sym_cache, &max_event_age, &oldest_event_time, dry, &threads, cpu_freq)?;
     }
 
     Ok(())

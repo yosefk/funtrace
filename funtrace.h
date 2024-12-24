@@ -62,6 +62,7 @@ struct funtrace_snapshot* funtrace_pause_and_get_snapshot();
    both to save time & space and to get "the part you want" (like from the
    start of handling some event till the end) */
 uint64_t funtrace_time(); /* timestamp from the same source used for tracing */
+uint64_t funtrace_ticks_per_second(); /* funtrace_time()/funtrace_ticks_per_second() converts time to seconds */
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time);
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot_up_to_age(uint64_t max_event_age);
 void funtrace_free_procmaps(struct funtrace_procmaps* procmaps);

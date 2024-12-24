@@ -40,7 +40,7 @@ def get_vector_elements(v):
         return [start[i] for i in range(finish-start)] 
 
 def write_funtrace(f):
-    write_chunk(f, b'FUNTRACE', b'')
+    write_chunk(f, b'FUNTRACE', struct.pack('Q', int(gdb.parse_and_eval('g_funtrace_cpu_freq'))))
     thread_traces = get_vector_elements(gdb.parse_and_eval('g_trace_state.thread_traces'))
     buf_size = int(gdb.parse_and_eval('funtrace_buf_size'))
     for i, trace in enumerate(thread_traces):

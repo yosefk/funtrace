@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <set>
 #include <mutex>
 #include <vector>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cassert>
+#include <unistd.h>
 #include "funtrace.h"
 #include "funtrace_buf_size.h"
 
@@ -175,6 +177,98 @@ struct trace_global_state
 
 trace_global_state g_trace_state;
 
+// the code below for getting the TSC frequency is straight from an LLM,
+// and I'm not sure when it doesn't work. when we see at runtime
+// that it doesn't we fall back on parsing dmesg, and if that fails,
+// on usleeping and measuring the number of ticks it took.
+//
+// LLVM XRay uses /sys/devices/system/cpu/cpu0/tsc_freq_khz but it
+// recommends against using it in production and it's not available
+// by default; see https://blog.trailofbits.com/2019/10/03/tsc-frequency-for-all-better-profiling-and-benchmarking/
+//
+// a better method for getting the TSC frequency would be most welcome.
+
+// Structure to hold CPUID leaf 15H return values
+struct cpuid_15h_t {
+    uint32_t eax;  // denominator
+    uint32_t ebx;  // numerator
+    uint32_t ecx;  // nominal frequency in Hz
+    uint32_t edx;  // reserved
+};
+
+// Function to execute CPUID instruction
+static inline void NOINSTR cpuid(uint32_t leaf, uint32_t subleaf, 
+                        uint32_t *eax, uint32_t *ebx,
+                        uint32_t *ecx, uint32_t *edx) {
+    __asm__ __volatile__ (
+        "cpuid"
+        : "=a" (*eax), "=b" (*ebx), "=c" (*ecx), "=d" (*edx)
+        : "a" (leaf), "c" (subleaf)
+    );
+}
+
+// Function to get TSC frequency using CPUID leaf 15H
+static uint64_t NOINSTR get_tsc_freq(void) {
+    struct cpuid_15h_t res;
+    uint32_t max_leaf;
+    
+    // First check if CPUID leaf 15H is supported
+    cpuid(0, 0, &max_leaf, &res.ebx, &res.ecx, &res.edx);
+    if (max_leaf < 0x15) {
+        //printf("CPUID leaf 15H not supported\n");
+        return 0;
+    }
+    
+    // Get values from leaf 15H
+    cpuid(0x15, 0, &res.eax, &res.ebx, &res.ecx, &res.edx);
+    
+    // Check if values are valid
+    if (res.eax == 0 || res.ebx == 0) {
+        //printf("Invalid CPUID.15H values returned\n");
+        return 0;
+    }
+    
+    // If ECX is non-zero, it provides the nominal frequency directly
+    if (res.ecx) {
+        uint64_t tsc_hz = ((uint64_t)res.ecx * res.ebx) / res.eax;
+        return tsc_hz;
+    } else {
+        // If ECX is zero, we need crystal clock frequency
+        // This is typically 24MHz or 25MHz for Intel processors
+        // You might want to get this from BIOS or assume a common value
+        const uint64_t crystal_hz = 24000000; // Assume 24MHz
+        uint64_t tsc_hz = (crystal_hz * res.ebx) / res.eax;
+        return tsc_hz;
+    }
+}
+
+static uint64_t cpu_cycles_per_second()
+{
+    uint64_t freq = 0;
+    freq = get_tsc_freq();
+    if(!freq) {
+        FILE* f = popen("dmesg | grep -o '[^ ]* MHz TSC'", "r");
+        float freq_mhz = 0;
+        if(fscanf(f, "%f", &freq_mhz)) {
+            freq = freq_mhz * 1000000;
+        }
+        pclose(f);
+    } 
+    if(!freq) {
+        uint64_t start = __rdtsc();
+        usleep(100*1000); //sleep for 100ms
+        uint64_t finish = __rdtsc();
+        freq = (finish - start)*10; //not too accurate but seriously we shouldn't ever need this code
+    }
+    return freq;
+}
+
+//we need this as a global variable for funtrace_gdb.py which might not run on the same CPU
+//as the core dump it is used on
+uint64_t g_funtrace_cpu_freq = cpu_cycles_per_second();
+
+extern "C" uint64_t NOINSTR funtrace_ticks_per_second() { return g_funtrace_cpu_freq; }
+
 struct funtrace_procmaps
 {
     std::vector<char> data;
@@ -184,12 +278,17 @@ struct funtrace_procmaps
 
 const int MAGIC_LEN = 8;
 
+static void NOINSTR write_chunk(std::ostream& file, const char* magic, const void* data, uint64_t bytes)
+{
+    assert(strlen(magic) == MAGIC_LEN);
+    file.write(magic, MAGIC_LEN);
+    file.write((char*)&bytes, sizeof bytes);
+    file.write((char*)data, bytes);
+}
+
 static void NOINSTR write_procmaps(std::ostream& file, funtrace_procmaps* procmaps)
 {
-    file.write("PROCMAPS", MAGIC_LEN);
-    uint64_t size = procmaps->data.size();
-    file.write((char*)&size, sizeof size);
-    file.write(&procmaps->data[0], size);
+    write_chunk(file, "PROCMAPS", &procmaps->data[0], procmaps->data.size());
 }
 
 struct event_buffer
@@ -200,16 +299,11 @@ struct event_buffer
 
 static void NOINSTR write_tracebufs(std::ostream& file, const std::vector<event_buffer>& thread_traces)
 {
-    char zero[sizeof(uint64_t)] = {0};
-    file.write("FUNTRACE", MAGIC_LEN);
-    file.write(zero, sizeof zero);
+    write_chunk(file, "FUNTRACE", &g_funtrace_cpu_freq, sizeof g_funtrace_cpu_freq);
     for(auto trace : thread_traces) {
-        file.write("TRACEBUF", MAGIC_LEN);
-        file.write((char*)&trace.bytes, sizeof trace.bytes);
-        file.write((char*)trace.buf, trace.bytes);
+        write_chunk(file, "TRACEBUF", trace.buf, trace.bytes);
     }
-    file.write("ENDTRACE", MAGIC_LEN);
-    file.write(zero, sizeof zero);
+    write_chunk(file, "ENDTRACE", "", 0);
 }
 
 extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
@@ -383,13 +477,13 @@ extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_up_
     return funtrace_pause_and_get_snapshot_starting_at_time(funtrace_time() - max_event_age);
 }
 
-void NOINSTR funtrace_ignore_this_thread()
+extern "C" void NOINSTR funtrace_ignore_this_thread()
 {
     g_trace_state.unregister_this_thread();
     g_thread_trace.free();
 }
 
-void funtrace_disable_tracing()
+extern "C" void funtrace_disable_tracing()
 {
     std::lock_guard<std::mutex> guard(g_trace_state.mutex);
     for(auto trace : g_trace_state.thread_traces) {
@@ -397,7 +491,8 @@ void funtrace_disable_tracing()
     }
 }
 
-void funtrace_enable_tracing()
+
+extern "C"  __attribute__((visibility("default")))  void funtrace_enable_tracing()
 {
     std::lock_guard<std::mutex> guard(g_trace_state.mutex);
     for(auto trace : g_trace_state.thread_traces) {
