@@ -68,10 +68,12 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
     // to all samples)
     let mut funcset: HashSet<SymInfo> = HashSet::new();
     let mut first_event = true;
+    let mut ignore_addrs: HashSet<u64> = HashSet::new();
 
     let oldest = oldest_event(sample_entries, max_event_age, oldest_event_time, threads);
 
     let cycles_per_us = cpu_freq as f64 / 1000000.0;
+    let cycles_per_ns = (cpu_freq as f64 / 1000000000.0 + 1.) as u64;
 
     for entries in sample_entries {
         if !threads.is_empty() && !threads.contains(&tid) {
@@ -94,12 +96,25 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
                     continue; //ignore old events
                 }
             }
-            let ret = entry.address >> RETURN_BIT;
+            let ret = (entry.address >> RETURN_BIT) != 0;
             let addr = entry.address & !(1<<RETURN_BIT);
-            if !dry && !sym_cache.contains_key(&addr) {
-                sym_cache.insert(addr, procaddr2sym.proc_addr2sym(addr));
+            if !dry {
+                if !sym_cache.contains_key(&addr) {
+                    let sym = procaddr2sym.proc_addr2sym(addr);
+                    //we ignore "virtual override thunks" because they aren't interesting
+                    //to the user, and what's more, some of them call __return__ but not
+                    //__fentry__ under -pg, so you get spurious "orphan returns" (see below
+                    //how we handle supposedly "real" orphan returns.)
+                    if sym.demangled_func.contains("virtual override thunk") {
+                        ignore_addrs.insert(addr);
+                    }
+                    sym_cache.insert(addr, sym);
+                }
+                if ignore_addrs.contains(&addr) {
+                    continue;
+                }
             }
-            if ret == 0 {
+            if !ret {
                 // call
                 stack.push(*entry);
             }
@@ -112,8 +127,11 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
                     //
                     // the "-num_orphan_returns" is here because vizviewer / Perfetto is
                     // thrown off by multiple calls starting at the same cycle and puts
-                    // them in the wrong lane on the timeline
-                    (earliest_cycle - num_orphan_returns, addr)
+                    // them in the wrong lane on the timeline (the JSON spec requires perfect
+                    // nesting of events). we multiply by cycles_per_ns
+                    // since Perfetto works at nanosecond accuracy and will treat timestamps
+                    // within the same ns as identical, the very thing we're trying to avoid
+                    (earliest_cycle - num_orphan_returns * cycles_per_ns, addr)
                 }
                 else {
                     let call_entry = stack.pop().unwrap();
@@ -123,26 +141,38 @@ fn write_sample_to_json(fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>
                 if dry {
                     continue;
                 }
-                let sym = sym_cache.get(&call_addr).unwrap();
+                let call_sym = sym_cache.get(&call_addr).unwrap();
+                //warn if we return to a different function from the one predicted by the call stack.
+                //this "shouldn't happen" but it does unless we ignore "virtual override thunks"
+                //and it's good to at least emit a warning when it does since the trace will look strange
+                let ret_sym = sym_cache.get(&addr).unwrap();
+                if ret_sym.static_addr != call_sym.static_addr {
+                    println!("      WARNING: call/return mismatch - {} called, {} returning", json_name(call_sym), json_name(ret_sym));
+                    println!("      call stack after the return:");
+                    for entry in stack.clone() {
+                        println!("        {}", json_name(sym_cache.get(&entry.address).unwrap()));
+                    }
+                }
+
                 // the redundant ph:X is needed to render the event on Perfetto's timeline, and pid:1
                 // for vizviewer --flamegraph to work
                 json.write(format!(r#"{}{{"tid":{},"ts":{:.4},"dur":{:.4},"name":{},"ph":"X","pid":1}}"#, 
                             if first_event { "" } else { "\n," },
-                            tid, call_cycle as f64/cycles_per_us, (entry.cycle-call_cycle) as f64/cycles_per_us, json_name(sym)).as_bytes())?; 
+                            tid, call_cycle as f64/cycles_per_us, (entry.cycle-call_cycle) as f64/cycles_per_us, json_name(call_sym)).as_bytes())?; 
 
                 first_event = false;
-                funcset.insert(sym.clone());
+                funcset.insert(call_sym.clone());
 
                 //cache the source code if it's the first time we see this file
-                if !source_cache.contains_key(&sym.file) {
+                if !source_cache.contains_key(&call_sym.file) {
                     let mut source_code: Vec<u8> = Vec::new();
-                    if let Ok(mut source_file) = File::open(&sym.file) {
+                    if let Ok(mut source_file) = File::open(&call_sym.file) {
                         source_file.read_to_end(&mut source_code)?;
                     }
                     let json_str = Value::String(String::from_utf8(source_code.clone()).unwrap()).to_string();
                     let num_lines = source_code.iter().filter(|&&b| b == b'\n').count(); //TODO: num newlines
                     //might be off by one relatively to num lines...
-                    source_cache.insert(sym.file.clone(), SourceCode{ json_str, num_lines });
+                    source_cache.insert(call_sym.file.clone(), SourceCode{ json_str, num_lines });
                 }
             }
         }
@@ -208,8 +238,18 @@ fn format_json_filename(basename: &String, number: u32) -> String {
     }
 }
 
+static mut PRINT_BIN_INFO: bool = false;
+
 fn json_name(sym: &SymInfo) -> String {
-    Value::String(format!("{} ({}:{})",sym.demangled_func, sym.file, sym.line)).to_string()
+    //"unsafe" access to a config parameter... I guess I should have put stuff into a struct and have
+    //most methods operate on it to make it prettier or something?..
+    let print_bin_info = unsafe { PRINT_BIN_INFO };
+    if print_bin_info {
+        Value::String(format!("{} ({}:{} {:#x}@{})", sym.demangled_func, sym.file, sym.line, sym.static_addr, sym.executable_file)).to_string()
+    }
+    else {
+        Value::String(format!("{} ({}:{})", sym.demangled_func, sym.file, sym.line)).to_string()
+    }
 }
 
 fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Option<u64>, oldest_event_time: Option<u64>, dry: bool, samples: &Vec<u32>, threads: &Vec<u32>) -> io::Result<()> {
@@ -301,21 +341,23 @@ fn parse_chunks(file_path: &String, json_basename: &String, max_event_age: Optio
 }
 
 #[derive(Parser)]
-#[clap(about="convert funtrace.raw to JSON files in the viztracer/vizviewer format (pip install viztracer)", version)]
+#[clap(about="convert funtrace.raw to JSON files in the viztracer/vizviewer format (pip install viztracer; or use Perfetto but then you won't see source code)", version)]
 struct Cli {
     #[clap(help="funtrace.raw input file with one or more trace samples")]
     functrace_raw: String,
     #[clap(help="basename.json, basename.1.json, basename.2.json... are created, one JSON file per trace sample")]
     out_basename: String,
-    #[clap(short, long, help="ignore events older than this relatively to the latest recorded event (very old events create the appearance of a giant blank timeline in vizviewer/Perfetto which zooms out to show the recorded timeline in full)")]
+    #[clap(short, long, help="print the static addresses and executable/shared object files of decoded functions in addition to name, file & line")]
+    executable_file_info: bool,
+    #[clap(short, long, help="ignore events older than this relatively to the latest recorded event in a given trace sample (very old events create the appearance of a giant blank timeline in vizviewer/Perfetto which zooms out to show the recorded timeline in full)")]
     max_event_age: Option<u64>,
-    #[clap(short, long, help="ignore events older than this cycle (like --max-event-age but as a timestamp instead of an age)")]
+    #[clap(short, long, help="ignore events older than this cycle (like --max-event-age but as a timestamp instead of an age in cycles)")]
     oldest_event_time: Option<u64>,
     #[clap(short, long, help="dry run - only list the samples & threads with basic stats, don't decode into JSON")]
     dry: bool,
-    #[clap(short, long, help="ignore samples with the indexes outside this list")]
+    #[clap(short, long, help="ignore samples with indexes outside this list")]
     samples: Vec<u32>,
-    #[clap(short, long, help="ignore threads with the indexes outside this list (including for the purpose of interpreting --max-event-age)")]
+    #[clap(short, long, help="ignore threads with indexes outside this list (including for the purpose of interpreting --max-event-age)")]
     threads: Vec<u32>,
 }
 
@@ -323,6 +365,9 @@ fn main() -> io::Result<()> {
     let args = Cli::parse();
     if args.max_event_age.is_some() && args.oldest_event_time.is_some() {
         panic!("both --max-event-age and --oldest-event-time specified - choose one");
+    }
+    unsafe {
+        PRINT_BIN_INFO = args.executable_file_info;
     }
     parse_chunks(&args.functrace_raw, &args.out_basename, args.max_event_age, args.oldest_event_time, args.dry, &args.samples, &args.threads)
 }

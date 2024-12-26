@@ -11,6 +11,7 @@ use goblin::elf::{Elf, ProgramHeader};
 use std::collections::HashMap;
 use std::fs::File;
 use memmap2::Mmap;
+use cpp_demangle;
 
 fn find_address_in_maps(address: u64, maps: &Vec<MemoryMap>) -> Option<&MemoryMap> {
     maps.binary_search_by(|map| {
@@ -26,10 +27,72 @@ fn find_address_in_maps(address: u64, maps: &Vec<MemoryMap>) -> Option<&MemoryMa
     .map(|index| &maps[index])
 }
 
+struct Symbol {
+    base_address: u64,
+    size: u64,
+    name: String,
+}
+
+fn read_elf_symbols(elf: &Elf) -> Vec<Symbol> {
+    // Create a vector to store our symbols
+    let mut symbols = Vec::new();
+
+    // Process dynamic symbols if they exist
+    for sym in elf.dynsyms.iter() {
+        // Get the symbol name from the dynamic string table
+        if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+            symbols.push(Symbol {
+                base_address: sym.st_value,
+                size: sym.st_size,
+                name: name.to_string(),
+            });
+        }
+    }
+
+    // Process regular symbols if they exist
+    for sym in elf.syms.iter() {
+        // Get the symbol name from the string table
+        if let Some(name) = elf.strtab.get_at(sym.st_name) {
+            symbols.push(Symbol {
+                base_address: sym.st_value,
+                size: sym.st_size,
+                name: name.to_string(),
+            });
+        }
+    }
+
+    // Sort symbols by base address
+    symbols.sort_by_key(|sym| sym.base_address);
+
+    symbols
+}
+
+fn find_symbol(symbols: &Vec<Symbol>, address: u64) -> Option<&Symbol> {
+    // Binary search for the largest base address that's <= our target address
+    let idx = match symbols.binary_search_by_key(&address, |sym| sym.base_address) {
+        Ok(exact) => exact,
+        Err(insert_pos) => {
+            if insert_pos == 0 {
+                return None;
+            }
+            insert_pos - 1
+        }
+    };
+
+    // Get candidate symbol and check if address falls within its range
+    let candidate = &symbols[idx];
+    if address >= candidate.base_address && address < candidate.base_address + candidate.size {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 struct ExecutableFileMetadata
 {
     program_headers: Vec<ProgramHeader>,
     addr2line: Context<EndianReader<RunTimeEndian, Rc<[u8]>>>,
+    symbols: Vec<Symbol>,
 }
 
 pub struct ProcAddr2Sym {
@@ -40,10 +103,20 @@ pub struct ProcAddr2Sym {
 
 #[derive(Debug, Clone, Hash, PartialEq, std::cmp::Eq)]
 pub struct SymInfo {
-    pub func: String,
-    pub demangled_func: String,
-    pub file: String,
-    pub line: u32,
+    pub func: String, //before c++filt
+    pub demangled_func: String, //after c++filt
+    //note that these are, whenever possible, the file:line of the FIRST function
+    //address, NOT the address passed to proc_addr2sym!
+    //TODO: given demand we can provide a way to pass the file:line of the actual
+    //address passed to proc_addr2sym
+    pub file: String, //source file
+    pub line: u32, //line number in the file
+    pub executable_file: String, //executable or shared object
+    pub static_addr: u64, //the address in the executable's symbol table
+    //(without the dynamic offset to which it's loaded - this offset is subtracted
+    //from the input address passed to proc_addr2sym()). like file:line, whenever
+    //possible, this is the base address of the function, not the address
+    //directly corresponding to the input dynamic address
 }
 
 impl ProcAddr2Sym {
@@ -63,7 +136,7 @@ impl ProcAddr2Sym {
     }
 
     pub fn proc_addr2sym(&mut self, proc_address: u64) -> SymInfo {
-        let unknown: SymInfo = SymInfo { func: "??".to_string(), demangled_func: "??".to_string(), file: "??".to_string(), line: 0 };
+        let unknown: SymInfo = SymInfo { func: "??".to_string(), demangled_func: "??".to_string(), file: "??".to_string(), line: 0, executable_file: "??".to_string(), static_addr: 0 };
 
         let map_opt = find_address_in_maps(proc_address, &self.maps);
         if map_opt == None { return unknown; }
@@ -81,10 +154,11 @@ impl ProcAddr2Sym {
             let file = File::open(path).expect("failed to open executable file");
             let buffer = unsafe { Mmap::map(&file).expect("failed to mmap executable file") };
             let elf = Elf::parse(&buffer).expect("Failed to parse ELF");
+            let symbols = read_elf_symbols(&elf);
             let program_headers = elf.program_headers.clone();
             let object = object::File::parse(&*buffer).expect("Failed to parse ELF");
             let ctx = addr2line::Context::new(&object).expect("Failed to create addr2line context");
-            self.sym_cache.insert(path.to_string_lossy().to_string(), ExecutableFileMetadata { program_headers, addr2line: ctx });
+            self.sym_cache.insert(path.to_string_lossy().to_string(), ExecutableFileMetadata { program_headers, addr2line: ctx, symbols });
         }
         let meta = self.sym_cache.get(&pathstr).unwrap();
 
@@ -102,32 +176,60 @@ impl ProcAddr2Sym {
             if !found { return unknown; } 
         }
         let vaddr_offset = self.offset_cache.get(&map.address.0).unwrap();
-        let address = proc_address - map.address.0 + vaddr_offset;
+        let mut static_addr = proc_address - map.address.0 + vaddr_offset;
 
-        let (file, linenum) = match meta.addr2line.find_location(address) {
+        let mut name = "??".to_string();
+        let mut demangled_func = "??".to_string();
+        let mut name_found = false;
+
+        if let Some(sym) = find_symbol(&meta.symbols, static_addr) {
+            name_found = true;
+            name = sym.name.clone();
+            static_addr = sym.base_address;
+            if let Ok(demsym) = cpp_demangle::Symbol::new(name.clone()) {
+                demangled_func = demsym.to_string();
+            }
+            else {
+                demangled_func = name.clone();
+            }
+        }
+
+        let (file, linenum) = match meta.addr2line.find_location(static_addr) {
             Ok(Some(location)) => (location.file.unwrap_or("??"), location.line.unwrap_or(0)),
             _ => ("??",0),
         };
 
-        //it could be better to use ELF symbol table lookup instead of DWARF name info
-        //(which has the advantage of having inlining information, with said advantage completely useless
-        //for us); this was done for writing little code and hopefully getting something more efficient
-        //than a linear lookup
-        let mut name = "??".to_string();
-        let mut demangled_func = "??".to_string();
-        if let Ok(frames) = meta.addr2line.find_frames(address).skip_all_loads() { 
-            if let Ok(Some(frame)) = frames.last() {
-                if let Some(funref) = frame.function.as_ref() {
-                    if let Ok(fname) = funref.raw_name() {
-                        name = fname.to_string();
-                        demangled_func = name.clone();
-                    }
-                    if let Ok(dname) = funref.demangle() {
-                        demangled_func = dname.to_string();
+        if !name_found {
+            //not sure if we are ever going to meet a case where there's no ELF symbol name
+            //but we do have DWARF debug info but can't hurt to try.
+            //
+            //there are at least 3 reasons not to use this code by itself, without bothering
+            //with ELF symbol tables at all:
+            //
+            //* sometimes you have ELF symbols but no DWARF debug info
+            //* some functions (such as "virtual" and "non-virtual" "thunks" auto-generated by gcc
+            //  have an ELF symbol but no debug info in DWARF (at least not function name info;
+            //  and incidentally we very much _need_ this info because such thunks have __return__
+            //  without __fentry__ and we need to keep this from mauling the decoded trace)
+            //* we want, at least in funtrace's context, to find file:line of the first function
+            //  address, which the ELF symbol readily makes available
+            //
+            //but it seems harmless to keep this code as fallback just in case
+            //(in any case we use addr2line for the file:line info so "the object is already there".)
+            if let Ok(frames) = meta.addr2line.find_frames(static_addr).skip_all_loads() { 
+                if let Ok(Some(frame)) = frames.last() {
+                    if let Some(funref) = frame.function.as_ref() {
+                        if let Ok(fname) = funref.raw_name() {
+                            name = fname.to_string();
+                            demangled_func = name.clone();
+                        }
+                        if let Ok(dname) = funref.demangle() {
+                            demangled_func = dname.to_string();
+                        }
                     }
                 }
             }
         }
-        SymInfo{func:name, demangled_func, file:file.to_string(), line:linenum}
+        SymInfo{func:name, demangled_func, file:file.to_string(), line:linenum, executable_file:pathstr, static_addr}
     }
 }

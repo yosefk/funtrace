@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 addr2line = "0.20"
+cpp_demangle = "0.4.4"
 goblin = "0.9.2"
 memmap2 = "0.9.5"
 procfs = "0.17.0"
