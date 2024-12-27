@@ -1,0 +1,30 @@
+#!/usr/bin/python3
+import sys
+import os
+import subprocess
+args = sys.argv[1:]
+
+# this linker wrapper lets us override XRay's functions like __xray_FunctionEntry;
+# for this it puts the XRay runtime libraries after our runtime code, and passes
+# --allow-multiple-definition
+
+start = None
+for i,arg in enumerate(args):
+    if arg == '--whole-archive':
+        start = i
+    elif arg == '--no-whole-archive' and start is not None:
+        end = i+1
+        break
+    elif 'xray' not in arg:
+        start = None
+
+if start is not None:
+    xraylibs = args[start:end]
+    args = args[:start] + args[end:]
+    stdlibspos = args.index('-lc')
+    args = args[:stdlibspos] + xraylibs + args[stdlibspos:]
+
+args += ['--allow-multiple-definition']
+
+ldpath = subprocess.getoutput('which ld')
+os.execl(ldpath, *([ldpath] + args))

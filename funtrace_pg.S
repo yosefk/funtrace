@@ -3,7 +3,13 @@
 	.p2align 4
 	.globl	__fentry__
 	.type	__fentry__, @function
+	.globl	__xray_FunctionEntry
+	.type	__xray_FunctionEntry, @function
+	.globl	exe_xray_FunctionEntry
+	.type	exe_xray_FunctionEntry, @function
 __fentry__:
+__xray_FunctionEntry:
+exe_xray_FunctionEntry:
 	.cfi_startproc
 
 	// r10 = __builtin_return_address(0)
@@ -38,10 +44,26 @@ __fentry__:
 
 	.cfi_endproc
 	.size	__fentry__, .-__fentry__
+	.size   __xray_FunctionEntry, .-__xray_FunctionEntry
+	.size   exe_xray_FunctionEntry, .-exe_xray_FunctionEntry
+
+
 	.p2align 4
 	.globl	__return__
 	.type	__return__, @function
+	.globl	__xray_FunctionExit
+	.type	__xray_FunctionExit, @function
+	.globl	exe_xray_FunctionExit
+	.type	exe_xray_FunctionExit, @function
+	.globl	__xray_FunctionTailExit //FIXME this needs to be its own handler
+	.type	__xray_FunctionTailExit, @function
+	.globl	exe_xray_FunctionTailExit //FIXME this needs to be its own handler
+	.type	exe_xray_FunctionTailExit, @function
 __return__:
+__xray_FunctionExit:
+exe_xray_FunctionExit:
+__xray_FunctionTailExit: //FIXME
+exe_xray_FunctionTailExit: //FIXME
 	.cfi_startproc
 
 	movq	(%rsp), %r10
@@ -77,3 +99,5 @@ __return__:
 
 	.cfi_endproc
 	.size	__return__, .-__return__
+	.size   __xray_FunctionExit, .-__xray_FunctionExit
+	.size	exe_xray_FunctionExit, .-exe_xray_FunctionExit
