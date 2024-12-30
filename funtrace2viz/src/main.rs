@@ -59,14 +59,15 @@ struct TraceConverter {
     dry: bool,
     samples: Vec<u32>,
     threads: Vec<u32>,
-    pub cpu_freq: u64,
+    cpu_freq: u64,
+    first_event_in_json: bool,
 }
 
 impl TraceConverter {
     pub fn new(args: &Cli) -> Self {
         TraceConverter { procaddr2sym: ProcAddr2Sym::new(), source_cache: HashMap::new(), sym_cache: HashMap::new(),
             max_event_age: args.max_event_age, oldest_event_time: args.oldest_event_time, dry: args.dry,
-            samples: args.samples.clone(), threads: args.threads.clone(), cpu_freq: 0 }
+            samples: args.samples.clone(), threads: args.threads.clone(), cpu_freq: 0, first_event_in_json: false }
     }
 
     fn oldest_event(&self, sample_entries: &Vec<Vec<FunTraceEntry>>) -> Option<u64> {
@@ -91,6 +92,35 @@ impl TraceConverter {
         }
     }
 
+    fn write_function_call_event(&mut self, json: &mut File, call_sym: &SymInfo, call_cycle: u64, return_cycle: u64, tid: u32, funcset: &mut HashSet<SymInfo>) -> io::Result<()> {
+        if self.dry {
+            return Ok(());
+        }
+        let cycles_per_us = self.cpu_freq as f64 / 1000000.0;
+    
+        // the redundant ph:X is needed to render the event on Perfetto's timeline, and pid:1
+        // for vizviewer --flamegraph to work
+        json.write(format!(r#"{}{{"tid":{},"ts":{:.4},"dur":{:.4},"name":{},"ph":"X","pid":1}}"#, 
+                    if self.first_event_in_json { "" } else { "\n," },
+                    tid, call_cycle as f64/cycles_per_us, (return_cycle-call_cycle) as f64/cycles_per_us, json_name(call_sym)).as_bytes())?; 
+    
+        self.first_event_in_json = false;
+        funcset.insert(call_sym.clone());
+    
+        //cache the source code if it's the first time we see this file
+        if !self.source_cache.contains_key(&call_sym.file) {
+            let mut source_code: Vec<u8> = Vec::new();
+            if let Ok(mut source_file) = File::open(&call_sym.file) {
+                source_file.read_to_end(&mut source_code)?;
+            }
+            let json_str = Value::String(String::from_utf8(source_code.clone()).unwrap()).to_string();
+            let num_lines = source_code.iter().filter(|&&b| b == b'\n').count(); //TODO: num newlines
+            //might be off by one relatively to num lines...
+            self.source_cache.insert(call_sym.file.clone(), SourceCode{ json_str, num_lines });
+        }
+        Ok(())
+    }
+
     fn write_sample_to_json(&mut self, fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>) -> io::Result<()> {
         let mut json = if self.dry { File::open("/dev/null")? } else { File::create(fname)? };
         if !self.dry {
@@ -109,12 +139,11 @@ impl TraceConverter {
         // json (the source cache persists across samples/jsons but not all files are relevant
         // to all samples)
         let mut funcset: HashSet<SymInfo> = HashSet::new();
-        let mut first_event = true;
+        self.first_event_in_json = true;
         let mut ignore_addrs: HashSet<u64> = HashSet::new();
     
         let oldest = self.oldest_event(sample_entries);
     
-        let cycles_per_us = self.cpu_freq as f64 / 1000000.0;
         let cycles_per_ns = (self.cpu_freq as f64 / 1000000000.0 + 1.) as u64;
     
         for entries in sample_entries {
@@ -139,27 +168,24 @@ impl TraceConverter {
                     }
                 }
                 let ret = (entry.address >> RETURN_BIT) != 0;
-                let tailcall = (entry.address >> TAILCALL_BIT) != 0;
+                let tailcall = ((entry.address >> TAILCALL_BIT) & 1) != 0;
                 let addr = entry.address & !((1<<RETURN_BIT) | (1<<TAILCALL_BIT));
-                if !self.dry {
-                    if !self.sym_cache.contains_key(&addr) {
-                        let sym = self.procaddr2sym.proc_addr2sym(addr);
-                        //we ignore "virtual override thunks" because they aren't interesting
-                        //to the user, and what's more, some of them call __return__ but not
-                        //__fentry__ under -pg, so you get spurious "orphan returns" (see below
-                        //how we handle supposedly "real" orphan returns.)
-                        if sym.demangled_func.contains("virtual override thunk") {
-                            ignore_addrs.insert(addr);
-                        }
-                        self.sym_cache.insert(addr, sym);
+                if !self.sym_cache.contains_key(&addr) {
+                    let sym = self.procaddr2sym.proc_addr2sym(addr);
+                    //we ignore "virtual override thunks" because they aren't interesting
+                    //to the user, and what's more, some of them call __return__ but not
+                    //__fentry__ under -pg, so you get spurious "orphan returns" (see below
+                    //how we handle supposedly "real" orphan returns.)
+                    if sym.demangled_func.contains("virtual override thunk") {
+                        ignore_addrs.insert(addr);
                     }
-                    if ignore_addrs.contains(&addr) {
-                        continue;
-                    }
+                    self.sym_cache.insert(addr, sym);
+                }
+                if ignore_addrs.contains(&addr) {
+                    continue;
                 }
                 //println!("ret {} sym {}", ret, json_name(sym_cache.get(&addr).unwrap()));
-                if !ret {
-                    // call
+                if !ret && !tailcall {
                     stack.push(*entry);
                 }
                 else {
@@ -179,10 +205,22 @@ impl TraceConverter {
                     }
                     else {
                         let call_entry = stack.pop().unwrap();
+                        if (call_entry.address & (1<<TAILCALL_BIT)) != 0 {
+                            println!("WARNING: a non-orphan tailcall popped from the stack, expected a call?..");
+                        }
                         (call_entry.cycle, call_entry.address)
                     };
-                    num_events += 1;
-                    if self.dry {
+                    if tailcall {
+                        //a tailcall from f to g means we won't ever see a return event from f - instead,
+                        //f jumps to g, and g returns straight to f's caller. when g returns to f's caller
+                        //(or when h tail-called by g returns to f's caller), we'll emit an event
+                        //returning from f, too. for this, we push an entry to the stack with TAILCALL_BIT set -
+                        //basically the same entry we just popped (f's), but with the bit set - essentially
+                        //we're "postponing its return for later."
+
+                        //either call addr is this entry's address (an orphan tail call) or we
+                        //popped it from the stack in which case it should have been a call, not a tailcall
+                        stack.push(FunTraceEntry{cycle: call_cycle, address: call_addr | (1<<TAILCALL_BIT)});
                         continue;
                     }
                     let call_sym = self.sym_cache.get(&call_addr).unwrap();
@@ -190,6 +228,7 @@ impl TraceConverter {
                     //this "shouldn't happen" but it does unless we ignore "virtual override thunks"
                     //and it's good to at least emit a warning when it does since the trace will look strange
                     let ret_sym = self.sym_cache.get(&addr).unwrap();
+                    //FIXME: adapt the warning for XRay
                     if false && ret_sym.static_addr != call_sym.static_addr {
                         println!("      WARNING: call/return mismatch - {} called, {} returning", json_name(call_sym), json_name(ret_sym));
                         println!("      call stack after the return:");
@@ -197,27 +236,23 @@ impl TraceConverter {
                             println!("        {}", json_name(self.sym_cache.get(&entry.address).unwrap()));
                         }
                     }
-    
-                    // the redundant ph:X is needed to render the event on Perfetto's timeline, and pid:1
-                    // for vizviewer --flamegraph to work
-                    json.write(format!(r#"{}{{"tid":{},"ts":{:.4},"dur":{:.4},"name":{},"ph":"X","pid":1}}"#, 
-                                if first_event { "" } else { "\n," },
-                                tid, call_cycle as f64/cycles_per_us, (entry.cycle-call_cycle) as f64/cycles_per_us, json_name(call_sym)).as_bytes())?; 
-    
-                    first_event = false;
-                    funcset.insert(call_sym.clone());
-    
-                    //cache the source code if it's the first time we see this file
-                    if !self.source_cache.contains_key(&call_sym.file) {
-                        let mut source_code: Vec<u8> = Vec::new();
-                        if let Ok(mut source_file) = File::open(&call_sym.file) {
-                            source_file.read_to_end(&mut source_code)?;
-                        }
-                        let json_str = Value::String(String::from_utf8(source_code.clone()).unwrap()).to_string();
-                        let num_lines = source_code.iter().filter(|&&b| b == b'\n').count(); //TODO: num newlines
-                        //might be off by one relatively to num lines...
-                        self.source_cache.insert(call_sym.file.clone(), SourceCode{ json_str, num_lines });
+                    //this is a return - keep popping from the stack until we find a call,
+                    //handle popped tail calls as returns from the called function
+                    num_events += 1;
+                    self.write_function_call_event(&mut json, &call_sym.clone(), call_cycle, entry.cycle, tid, &mut funcset)?;
+                    let mut returns = 1;
+                    while !stack.is_empty() && (stack.last().unwrap().address & (1<<TAILCALL_BIT)) != 0 {
+                        let last = stack.pop().unwrap();
+                        let tailcall_addr = last.address & !(1<<TAILCALL_BIT);
+                        let call_sym = self.sym_cache.get(&tailcall_addr).unwrap();
+                        num_events += 1;
+                        //we (or rather the Perfetto JSON spec) want perfect nesting, so we make sure there's an ns latency between the timestmaps
+                        //of returns from tailcalls (though eg XRay doesn't bother and have them return at the same cycle.) hope we won't
+                        //have too many returns from tailcalls for a return timestamp to exceed a next actual event timestamp...
+                        self.write_function_call_event(&mut json, &call_sym.clone(), last.cycle, entry.cycle + cycles_per_ns*returns, tid, &mut funcset)?;
+                        returns += 1;
                     }
+
                 }
             }
             if latest_cycle >= earliest_cycle {
