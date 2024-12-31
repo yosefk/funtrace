@@ -46,7 +46,7 @@ struct Cli {
     #[clap(short, long, help="ignore samples with indexes outside this list")]
     samples: Vec<u32>,
     #[clap(short, long, help="ignore threads with indexes outside this list (including for the purpose of interpreting --max-event-age)")]
-    threads: Vec<u32>,
+    threads: Vec<u64>,
 }
 
 struct TraceConverter {
@@ -58,9 +58,22 @@ struct TraceConverter {
     oldest_event_time: Option<u64>,
     dry: bool,
     samples: Vec<u32>,
-    threads: Vec<u32>,
+    threads: Vec<u64>,
     cpu_freq: u64,
     first_event_in_json: bool,
+}
+
+#[repr(C)]
+#[derive(Debug, Pod, Zeroable, Clone, Copy)]
+struct ThreadID
+{
+    pid: u64,
+    tid: u64,
+}
+
+struct ThreadTrace {
+    thread_id: ThreadID,
+    trace: Vec<FunTraceEntry>,
 }
 
 impl TraceConverter {
@@ -70,17 +83,15 @@ impl TraceConverter {
             samples: args.samples.clone(), threads: args.threads.clone(), cpu_freq: 0, first_event_in_json: false }
     }
 
-    fn oldest_event(&self, sample_entries: &Vec<Vec<FunTraceEntry>>) -> Option<u64> {
+    fn oldest_event(&self, sample_entries: &Vec<ThreadTrace>) -> Option<u64> {
         if let Some(max_age) = self.max_event_age {
             let mut youngest = 0;
-            let mut tid = 1;
             for entries in sample_entries {
-                if self.threads.is_empty() || self.threads.contains(&tid) {
-                    for entry in entries {
+                if self.threads.is_empty() || self.threads.contains(&entries.thread_id.tid) {
+                    for entry in entries.trace.iter() {
                         youngest = max(entry.cycle, youngest);
                     }
                 }
-                tid += 1;
             }
             Some(youngest - max_age)
         }
@@ -92,17 +103,17 @@ impl TraceConverter {
         }
     }
 
-    fn write_function_call_event(&mut self, json: &mut File, call_sym: &SymInfo, call_cycle: u64, return_cycle: u64, tid: u32, funcset: &mut HashSet<SymInfo>) -> io::Result<()> {
+    fn write_function_call_event(&mut self, json: &mut File, call_sym: &SymInfo, call_cycle: u64, return_cycle: u64, thread_id: &ThreadID, funcset: &mut HashSet<SymInfo>) -> io::Result<()> {
         if self.dry {
             return Ok(());
         }
-        let cycles_per_us = self.cpu_freq as f64 / 1000000.0;
+        let cycles_per_us = 1000.;///1.;//FIXME self.cpu_freq as f64 / 1000000.0;
     
         // the redundant ph:X is needed to render the event on Perfetto's timeline, and pid:1
         // for vizviewer --flamegraph to work
-        json.write(format!(r#"{}{{"tid":{},"ts":{:.4},"dur":{:.4},"name":{},"ph":"X","pid":1}}"#, 
+        json.write(format!(r#"{}{{"tid":{},"ts":{:.4},"dur":{:.4},"name":{},"ph":"X","pid":{}}}"#, 
                     if self.first_event_in_json { "" } else { "\n," },
-                    tid, call_cycle as f64/cycles_per_us, (return_cycle-call_cycle) as f64/cycles_per_us, json_name(call_sym)).as_bytes())?; 
+                    thread_id.tid, call_cycle as f64/cycles_per_us, (return_cycle-call_cycle) as f64/cycles_per_us, json_name(call_sym), thread_id.pid).as_bytes())?; 
     
         self.first_event_in_json = false;
         funcset.insert(call_sym.clone());
@@ -121,7 +132,7 @@ impl TraceConverter {
         Ok(())
     }
 
-    fn write_sample_to_json(&mut self, fname: &String, sample_entries: &Vec<Vec<FunTraceEntry>>) -> io::Result<()> {
+    fn write_sample_to_json(&mut self, fname: &String, sample_entries: &Vec<ThreadTrace>) -> io::Result<()> {
         let mut json = if self.dry { File::open("/dev/null")? } else { File::create(fname)? };
         if !self.dry {
             json.write(br#"{
@@ -132,7 +143,6 @@ impl TraceConverter {
         else {
             println!("inspecting sample {} (without creating the file...)", fname);
         }
-        let mut tid = 1;
     
         // we list the set of functions (to tell their file, line pair to vizviewer);
         // we also use this set to only dump the relevant part of the source cache to each
@@ -146,10 +156,10 @@ impl TraceConverter {
     
         let cycles_per_ns = (self.cpu_freq as f64 / 1000000000.0 + 1.) as u64;
     
-        for entries in sample_entries {
-            if !self.threads.is_empty() && !self.threads.contains(&tid) {
-                println!("ignoring thread {} - not on the list {:?}", tid, self.threads);
-                tid += 1;
+        for thread_trace in sample_entries {
+            let entries = &thread_trace.trace;
+            if !self.threads.is_empty() && !self.threads.contains(&thread_trace.thread_id.tid) {
+                println!("ignoring thread {} - not on the list {:?}", thread_trace.thread_id.tid, self.threads);
                 continue;
             }
             let mut stack: Vec<FunTraceEntry> = Vec::new();
@@ -239,7 +249,7 @@ impl TraceConverter {
                     //this is a return - keep popping from the stack until we find a call,
                     //handle popped tail calls as returns from the called function
                     num_events += 1;
-                    self.write_function_call_event(&mut json, &call_sym.clone(), call_cycle, entry.cycle, tid, &mut funcset)?;
+                    self.write_function_call_event(&mut json, &call_sym.clone(), call_cycle, entry.cycle, &thread_trace.thread_id, &mut funcset)?;
                     let mut returns = 1;
                     while !stack.is_empty() && (stack.last().unwrap().address & (1<<TAILCALL_BIT)) != 0 {
                         let last = stack.pop().unwrap();
@@ -249,15 +259,14 @@ impl TraceConverter {
                         //we (or rather the Perfetto JSON spec) want perfect nesting, so we make sure there's an ns latency between the timestmaps
                         //of returns from tailcalls (though eg XRay doesn't bother and have them return at the same cycle.) hope we won't
                         //have too many returns from tailcalls for a return timestamp to exceed a next actual event timestamp...
-                        self.write_function_call_event(&mut json, &call_sym.clone(), last.cycle, entry.cycle + cycles_per_ns*returns, tid, &mut funcset)?;
+                        self.write_function_call_event(&mut json, &call_sym.clone(), last.cycle, entry.cycle + cycles_per_ns*returns, &thread_trace.thread_id, &mut funcset)?;
                         returns += 1;
                     }
 
                 }
             }
             if latest_cycle >= earliest_cycle {
-                println!("  thread {} - {} recent function calls logged over {} cycles [{} - {}]", tid, num_events, latest_cycle-earliest_cycle, earliest_cycle, latest_cycle);
-                tid += 1;
+                println!("  thread {} - {} recent function calls logged over {} cycles [{} - {}]", thread_trace.thread_id.tid, num_events, latest_cycle-earliest_cycle, earliest_cycle, latest_cycle);
             }
             else {
                 println!("    skipping a thread (all {} logged function entry/return events are too old)", entries.len());
@@ -309,11 +318,13 @@ impl TraceConverter {
         Ok(())
     }
 
-    fn parse_chunks(&mut self, file_path: &String, json_basename: &String) -> io::Result<()> {
+    pub fn parse_chunks(&mut self, file_path: &String, json_basename: &String) -> io::Result<()> {
         let mut file = File::open(file_path)?;
     
-        let mut sample_entries: Vec<Vec<FunTraceEntry>> = Vec::new();
+        let mut sample_entries: Vec<ThreadTrace> = Vec::new();
         let mut num_json = 0;
+
+        let mut thread_id = ThreadID { pid: 0, tid: 0 };
 
         loop {
             //the file consists of chunks with an 8-byte magic string telling the chunk
@@ -362,6 +373,14 @@ impl TraceConverter {
                 self.procaddr2sym.set_proc_maps(chunk_content.as_slice());
                 //the symbol cache might have been invalidated if the process unloaded and reloaded a shared object
                 self.sym_cache = HashMap::new();
+            } else if &magic == b"THREADID" {
+                if chunk_length != 16 {
+                    println!("Unexpected THREAD chunk length {} - expecting 16", chunk_length);
+                    file.seek(SeekFrom::Current(chunk_length as i64))?;
+                    continue;
+                }
+
+                file.read_exact(bytemuck::bytes_of_mut(&mut thread_id))?;
             } else if &magic == b"TRACEBUF" {
                 if chunk_length % mem::size_of::<FunTraceEntry>() != 0 {
                     println!("Invalid TRACEBUF chunk length {} - must be a multiple of {}", chunk_length, mem::size_of::<FunTraceEntry>());
@@ -370,11 +389,11 @@ impl TraceConverter {
                 }
     
                 let num_entries = chunk_length / mem::size_of::<FunTraceEntry>();
-                let mut entries = vec![FunTraceEntry { address: 0, cycle: 0 }; num_entries];
-                file.read_exact(bytemuck::cast_slice_mut(&mut entries))?;
-                entries.retain(|&entry| !(entry.cycle == 0 && entry.address == 0));
-                if !entries.is_empty() {
-                    entries.sort_by_key(|entry| entry.cycle);
+                let mut entries = ThreadTrace { thread_id, trace: vec![FunTraceEntry { address: 0, cycle: 0 }; num_entries] };
+                file.read_exact(bytemuck::cast_slice_mut(&mut entries.trace))?;
+                entries.trace.retain(|&entry| !(entry.cycle == 0 && entry.address == 0));
+                if !entries.trace.is_empty() {
+                    entries.trace.sort_by_key(|entry| entry.cycle);
                     sample_entries.push(entries);
                 }
             } else {

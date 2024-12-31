@@ -50,6 +50,7 @@ struct trace_data
     trace_entry* pos; //pos points into buf which must be aligned to FUNTRACE_BUF_SIZE
     bool enabled;
     trace_entry* buf;
+    uint64_t tid;
 
     inline void NOINSTR pause_tracing() { enabled = false; }
     inline void NOINSTR resume_tracing() { enabled = true; }
@@ -146,8 +147,12 @@ struct trace_global_state
     //and destroyed threads adding/removing their trace buffers to the set)
     //and trace_file (from calls to funtrace_pause_and_write_current_snapshot()
     //which might come from multiple threads)
+    uint64_t pid;
 
-    NOINSTR trace_global_state() {}
+    NOINSTR trace_global_state()
+    {
+        pid = getpid();
+    }
     NOINSTR ~trace_global_state() {}
 
     std::ostream& NOINSTR file()
@@ -158,10 +163,11 @@ struct trace_global_state
         return trace_file;
     }
 
-    //should be called once - can't be called again before unregister_this_thread()
+    //can't be called more than once before unregister_this_thread()
     void NOINSTR register_this_thread()
     {
         std::lock_guard<std::mutex> guard(mutex);
+        g_thread_trace.tid = gettid();
         thread_traces.push_back(&g_thread_trace);
     }
 
@@ -299,12 +305,15 @@ struct event_buffer
 {
     trace_entry* buf;
     uint64_t bytes;
+    uint64_t tid;
 };
 
 static void NOINSTR write_tracebufs(std::ostream& file, const std::vector<event_buffer>& thread_traces)
 {
     write_chunk(file, "FUNTRACE", &g_funtrace_cpu_freq, sizeof g_funtrace_cpu_freq);
     for(auto trace : thread_traces) {
+        uint64_t id[] = {g_trace_state.pid, trace.tid};
+        write_chunk(file, "THREADID", id, sizeof id);
         write_chunk(file, "TRACEBUF", trace.buf, trace.bytes);
     }
     write_chunk(file, "ENDTRACE", "", 0);
@@ -329,7 +338,7 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     //(we didn't mind briefly allocating procmaps because it's very little data)
     std::vector<event_buffer> traces;
     for(auto trace : g_trace_state.thread_traces) {
-        traces.push_back(event_buffer{trace->buf, FUNTRACE_BUF_SIZE});
+        traces.push_back(event_buffer{trace->buf, FUNTRACE_BUF_SIZE, trace->tid});
     }
     write_tracebufs(file, traces);
 
@@ -374,7 +383,7 @@ funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
     for(auto trace : g_trace_state.thread_traces) {
         trace_entry* copy = (trace_entry*)new char[FUNTRACE_BUF_SIZE];
         memcpy(copy, trace->buf, FUNTRACE_BUF_SIZE);
-        snapshot->thread_traces.push_back(event_buffer{copy, FUNTRACE_BUF_SIZE});
+        snapshot->thread_traces.push_back(event_buffer{copy, FUNTRACE_BUF_SIZE, trace->tid});
     }
     for(auto trace : g_trace_state.thread_traces) {
         trace->resume_tracing();
