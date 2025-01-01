@@ -12,6 +12,8 @@
 #include <cstring>
 #include <cassert>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "funtrace.h"
 #include "funtrace_buf_size.h"
 
@@ -308,15 +310,45 @@ struct event_buffer
     uint64_t tid;
 };
 
-static void NOINSTR write_tracebufs(std::ostream& file, const std::vector<event_buffer>& thread_traces)
+static void NOINSTR write_funtrace(std::ostream& file)
 {
     write_chunk(file, "FUNTRACE", &g_funtrace_cpu_freq, sizeof g_funtrace_cpu_freq);
+}
+
+static void NOINSTR write_endtrace(std::ostream& file)
+{
+    write_chunk(file, "ENDTRACE", "", 0);
+}
+
+static void NOINSTR write_tracebufs(std::ostream& file, const std::vector<event_buffer>& thread_traces)
+{
     for(auto trace : thread_traces) {
         uint64_t id[] = {g_trace_state.pid, trace.tid};
         write_chunk(file, "THREADID", id, sizeof id);
         write_chunk(file, "TRACEBUF", trace.buf, trace.bytes);
     }
-    write_chunk(file, "ENDTRACE", "", 0);
+}
+
+static void ftrace_events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp=0);
+
+static void NOINSTR write_ftrace(std::ostream& file, const std::vector<std::string>& events)
+{
+    if(events.empty()) {
+        return;
+    }
+    uint64_t size = 0;
+    for(const auto& s : events) {
+        if(!s.empty()) {
+            size += s.size() + 1; //+1 for the newline
+        }
+    }
+    file.write("FTRACETX", MAGIC_LEN);
+    file.write((char*)&size, sizeof size);
+    for(const auto& s : events) {
+        if(!s.empty()) {
+            file << s << '\n';
+        }
+    }
 }
 
 extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
@@ -340,12 +372,18 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     for(auto trace : g_trace_state.thread_traces) {
         traces.push_back(event_buffer{trace->buf, FUNTRACE_BUF_SIZE, trace->tid});
     }
+    write_funtrace(file);
     write_tracebufs(file, traces);
 
     for(auto trace : g_trace_state.thread_traces) {
         trace->resume_tracing();
     }
 
+    std::vector<std::string> ftrace_snapshot;
+    ftrace_events_snapshot(ftrace_snapshot);
+    write_ftrace(file, ftrace_snapshot);
+     
+    write_endtrace(file);
     file.flush();
 }
 
@@ -369,6 +407,7 @@ extern "C" funtrace_procmaps* NOINSTR funtrace_get_procmaps()
 struct funtrace_snapshot
 {
     std::vector<event_buffer> thread_traces;
+    std::vector<std::string> ftrace_events;
     NOINSTR funtrace_snapshot() {}
     NOINSTR ~funtrace_snapshot() {}
 };
@@ -388,6 +427,7 @@ funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
     for(auto trace : g_trace_state.thread_traces) {
         trace->resume_tracing();
     }
+    ftrace_events_snapshot(snapshot->ftrace_events);
     return snapshot;
 }
 
@@ -408,7 +448,11 @@ extern "C" void NOINSTR funtrace_write_saved_snapshot(const char* filename, funt
 {
     std::ofstream file(filename);
     write_procmaps(file, procmaps);
+    write_funtrace(file);
     write_tracebufs(file, snapshot->thread_traces);
+    write_ftrace(file, snapshot->ftrace_events);
+    write_endtrace(file);
+    file.flush();
 }
 
 extern "C" uint64_t NOINSTR funtrace_time()
@@ -482,6 +526,7 @@ extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_sta
     for(auto trace : g_trace_state.thread_traces) {
         trace->resume_tracing();
     }
+    ftrace_events_snapshot(snapshot->ftrace_events, time);
     return snapshot;
 }
 
@@ -604,26 +649,21 @@ struct sigtrap_handler
     std::mutex mutex;
     std::thread thread;
     std::atomic<bool> quit;
-    std::atomic<bool> done;
 
     static void NOINSTR signal_handler(int);
     void NOINSTR thread_func();
     NOINSTR sigtrap_handler()
     {
-        mutex.lock();
         quit = false;
-        done = false;
+        mutex.lock();
         thread = std::thread([this] {
             thread_func();
         });
         signal(SIGTRAP, signal_handler);
     }
-    NOINSTR ~sigtrap_handler()
-    {
+    NOINSTR ~sigtrap_handler() {
         quit = true;
-        while(!done) {
-            mutex.unlock();
-        }
+        mutex.unlock();
         thread.join();
     }
 }
@@ -638,10 +678,10 @@ void NOINSTR sigtrap_handler::thread_func()
 {
     //we don't want to trace the SIGTRAP-handling thread
     funtrace_ignore_this_thread();
+    pthread_setname_np(pthread_self(), "funtraceSIGTRAP");
     while(true) {
         mutex.lock();
         if(quit) {
-            done = true;
             break;
         }
         funtrace_pause_and_write_current_snapshot();
@@ -649,3 +689,242 @@ void NOINSTR sigtrap_handler::thread_func()
 }
 
 #endif //FUNTRACE_NO_SIGTRAP
+
+#ifndef FUNTRACE_NO_FTRACE
+
+struct ftrace_event
+{
+    uint64_t timestamp;
+    std::string line;
+};
+
+struct ftrace_handler
+{
+    std::mutex mutex;
+    std::thread thread;
+    std::string base;
+    bool init_errors = false;
+    std::vector<ftrace_event> events; //cyclic buffer
+    int pos = 0;
+    std::atomic<bool> quit;
+
+    NOINSTR ftrace_handler() {
+        quit = false;
+        if(getenv("FUNTRACE_NO_FTRACE")) {
+            init_errors = true;
+            return;
+        }
+        ftrace_init();
+        if(init_errors) {
+            //no point in spawning a thread to collect ftrace events
+            return;
+        }
+        events.resize(FUNTRACE_FTRACE_EVENTS_IN_BUF);
+        thread = std::thread([this] {
+            thread_func();
+        });
+    }
+    NOINSTR ~ftrace_handler() {
+        //we make sure the thread is awakened by a thread-spawning event,
+        //and then wait for it to quit.
+        quit = true;
+        auto dummy = std::thread([] {});
+        thread.join();
+        dummy.join();
+    }
+    void NOINSTR thread_func();
+    void NOINSTR ftrace_init();
+    void NOINSTR warn(const char* what)
+    {
+        if(init_errors) {
+            return;
+        }
+        printf("WARNING: funtrace - error initializing ftrace (%s - %s), compile with -DFUNTRACE_NO_FTRACE or "
+               "setenv FUNTRACE_NO_FTRACE at runtime if you don't want to collect ftrace / see this warning\n", what, strerror(errno));
+        init_errors = true;
+    }
+    void NOINSTR write_file(const char* file, const char* contents)
+    {
+        std::string fullpath = base+file;
+        std::ofstream f(fullpath);
+        if(!f) {
+            warn(("failed to open " + fullpath).c_str());
+        }
+        f << contents;
+    }
+    //we're parsing the timestamp from a line like this:
+    //  main-58704   [010] d.... 1473223221396767: sched_switch: prev_comm=main prev_pid=58704 prev_prio=120 prev_state=D ==> next_comm=swapper/10 next_pid=0 next_prio=120
+    static uint64_t NOINSTR parse_timestamp(const std::string& line)
+    {
+        const char* p = line.c_str();
+        //we're expecting ": "...
+        const char* q = strstr(p, ": ");
+        if(!q) {
+            return 0;
+        }
+        //...preceded by " [0-9]+"
+        uint64_t time = 0;
+        uint64_t mult = 1;
+        while(q > p && *--q != ' ') {
+            if(*q < '0' || *q > '9') {
+                return 0;
+            }
+            time += (*q - '0')*mult;
+            mult *= 10;
+        }
+        if(*q != ' ') {
+            return 0;
+        }
+        return time;
+    }
+    void NOINSTR events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp=0);
+}
+g_ftrace_handler;
+
+void NOINSTR ftrace_handler::ftrace_init()
+{
+    //create our own tracer instance (note that we name it "after ourselves" but we don't
+    //eg mangle the name by PID to ensure it's unique since that would require cleaning it up
+    //upon process termination to avoid creating too many and not sure how this should be done;
+    //there's some trick using mount which apparently requires root permissions/capabilities
+    //or we could have a process removing it when this process dies but this sounds like it
+    //could come with its own problems)
+    char buf[128]={0};
+    pthread_getname_np(pthread_self(), buf, sizeof buf);
+    base = std::string("/sys/kernel/tracing/instances/funtrace.") + buf + "/";
+    struct stat s;
+    if(stat(base.c_str(), &s) && mkdir(base.c_str(), 0666)) {
+        warn(("failed to create ftrace instance directory "+base).c_str());
+        return;
+    }
+    //disable tracing clear the trace buffer (our instance could have kept some data from last time)
+    write_file("tracing_on", "0");
+    write_file("trace", "");
+
+    //the events Perfetto traces & looks at judging by a simple experiment
+    //(running their Linux tracing tutorial and checking the collected trace)
+    write_file("events/sched/sched_switch/enable", "1");
+    write_file("events/sched/sched_waking/enable", "1");
+    write_file("events/task/task_newtask/enable", "1");
+    write_file("events/task/task_rename/enable", "1");
+
+    //only trace events from this PID...
+    char pid[128];
+    sprintf(pid,"%d",getpid());
+    write_file("set_event_pid", pid);
+    //...and threads & processes forked by it
+    write_file("options/event-fork", "1");
+
+    //use TSC for timestamps so we can sync with funtrace timestamps
+    write_file("trace_clock", "x86-tsc");
+}
+
+//experimentally, it takes ~100 ms to read /sys/kernel/tracing/trace and count
+//its lines using wc -l, with /sys/kernel/tracing/buffer_total_size_kb at 448K
+//and ~10K events of the type we're listening to logged. if this was faster
+//(which maybe it could be, if we were using the binary ring buffer format
+//rather than the textual format - but that requires quite a bit more knowledge
+//of ftrace), it could make sense to read the entire trace buffer when taking
+//a snapshot (and delay its parsing done in order to trim the time range of the
+//events to the time range of funtrace events to when the snapshot is saved).
+//but given the relatively high latency it seems better to accumulate events
+//
+//into our own buffer incrementally in a background thread; as an added
+//bonus we can easily trim the events by a time range by the time we need
+//to take a snapshot since we're parsing the timestamps incrementally as well.
+//
+//a nice side effect of reading ftrace data into an internal buffer
+//is being able to read it from a core dump without any provisions made at
+//core dump time to save ftrace data aside
+void NOINSTR ftrace_handler::thread_func()
+{
+    funtrace_ignore_this_thread();
+
+    pthread_setname_np(pthread_self(), "funtrace-ftrace");
+    //ignore scheduling events related to this thread (or it will read them from the pipe,
+    //with this processing generating more events for it to read from the pipe...)
+    char buf[128]={0};
+    int tid = gettid();
+    snprintf(buf, sizeof buf, "prev_pid != %d && next_pid != %d", tid, tid);
+    write_file("events/sched/sched_switch/filter", buf);
+    snprintf(buf, sizeof buf, "pid != %d && common_pid != %d", tid, tid);
+    write_file("events/sched/sched_waking/filter", buf);
+
+    //enable tracing
+    write_file("tracing_on", "1");
+
+    std::ifstream trace_pipe(base+"trace_pipe");
+    while(!quit) {
+        std::string line;
+        std::getline(trace_pipe, line);
+
+        //std::cout << line << std::endl;
+        mutex.lock();
+
+        uint64_t timestamp = parse_timestamp(line);
+        //std::cout << "  " << timestamp << std::endl;
+        if(timestamp) { //some lines aren't events, eg ftrace might say that
+            //CPU so and so lost so many events (though we hope our diligent
+            //readout and careful event filtering will prevent this unfortunate
+            //condition...)
+            events[pos].line = line;
+            events[pos].timestamp = timestamp;
+            pos = (pos + 1) % events.size();
+        }
+
+        mutex.unlock();
+    }
+}
+
+void NOINSTR ftrace_handler::events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp)
+{
+    auto copy = [](std::vector<std::string>::iterator to, const ftrace_event* from_b, const ftrace_event* from_e) -> std::vector<std::string>::iterator {
+        while(from_b < from_e) {
+            *to++ = from_b->line;
+            from_b++;
+        }
+        return to;
+    };
+    std::lock_guard<std::mutex> guard(mutex);
+    //the logic here is similar to that in funtrace_pause_and_get_snapshot_starting_at_time -
+    //we treat the cyclic buffer as 2 sorted arrays - except there are no complications around
+    //data getting overwritten while we're reading it since we're holding a mutex protecting
+    //the cyclic buffer
+    auto find_earliest_event_after = [&](const ftrace_event* b, const ftrace_event* e) {
+        ftrace_event evt;
+        evt.timestamp = earliest_timestamp;
+        auto p = std::lower_bound(b, e, evt, [=](const ftrace_event& e1, const ftrace_event& e2) {
+            return e1.timestamp < e2.timestamp;
+        });
+        return p == e ? nullptr : p;
+    };
+    auto buf = &events[0];
+    auto pos = buf + this->pos;
+    auto end = buf + events.size();
+    auto earliest_right = find_earliest_event_after(pos, end);
+    auto earliest_left = find_earliest_event_after(buf, pos);
+    uint64_t entries = (earliest_left ? pos-earliest_left : 0) + (earliest_right ? end-earliest_right : 0);
+    snapshot.resize(entries);
+    auto copy_to = snapshot.begin();
+    //for ftrace we want the events in the output to be sorted; those to the right of pos are the earlier ones
+    if(earliest_right) {
+        copy_to = copy(copy_to, earliest_right, end);
+    }
+    if(earliest_left) {
+        copy_to = copy(copy_to, earliest_left, pos);
+    }
+    assert(uint64_t(copy_to - snapshot.begin()) == entries);
+}
+
+static void NOINSTR ftrace_events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp) 
+{
+    g_ftrace_handler.events_snapshot(snapshot, earliest_timestamp);
+}
+
+#else
+
+static void NOINSTR ftrace_events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp) 
+{
+}
+
+#endif
