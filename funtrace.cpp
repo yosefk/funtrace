@@ -245,12 +245,16 @@ static uint64_t NOINSTR get_tsc_freq(void) {
         uint64_t tsc_hz = ((uint64_t)res.ecx * res.ebx) / res.eax;
         return tsc_hz;
     } else {
+        // let's try other methods
+        return 0;
+        /* this might have been an OK fallback but we probably have better fallbacks
         // If ECX is zero, we need crystal clock frequency
         // This is typically 24MHz or 25MHz for Intel processors
         // You might want to get this from BIOS or assume a common value
         const uint64_t crystal_hz = 24000000; // Assume 24MHz
         uint64_t tsc_hz = (crystal_hz * res.ebx) / res.eax;
         return tsc_hz;
+        */
     }
 }
 
@@ -329,7 +333,8 @@ static void NOINSTR write_tracebufs(std::ostream& file, const std::vector<event_
     }
 }
 
-static void ftrace_events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp=0);
+//the default timestamp threshold of 1 cuts off uninitialized events with timestamp=0
+static void ftrace_events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp=1);
 
 static void NOINSTR write_ftrace(std::ostream& file, const std::vector<std::string>& events)
 {
@@ -338,16 +343,12 @@ static void NOINSTR write_ftrace(std::ostream& file, const std::vector<std::stri
     }
     uint64_t size = 0;
     for(const auto& s : events) {
-        if(!s.empty()) {
-            size += s.size() + 1; //+1 for the newline
-        }
+        size += s.size() + 1; //+1 for the newline
     }
     file.write("FTRACETX", MAGIC_LEN);
     file.write((char*)&size, sizeof size);
     for(const auto& s : events) {
-        if(!s.empty()) {
-            file << s << '\n';
-        }
+        file << s << '\n';
     }
 }
 
@@ -521,7 +522,7 @@ extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_sta
             copy_to = std::copy(earliest_left, pos, copy_to);
         }
         assert(uint64_t(copy_to - copy) == entries);
-        snapshot->thread_traces.push_back(event_buffer{copy, entries*sizeof(trace_entry)});
+        snapshot->thread_traces.push_back(event_buffer{copy, entries*sizeof(trace_entry), trace->tid});
     }
     for(auto trace : g_trace_state.thread_traces) {
         trace->resume_tracing();
@@ -777,7 +778,7 @@ struct ftrace_handler
         }
         return time;
     }
-    void NOINSTR events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp=0);
+    void NOINSTR events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp);
 }
 g_ftrace_handler;
 

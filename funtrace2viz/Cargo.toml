@@ -10,3 +10,4 @@ procaddr2sym = { path = "../procaddr2sym" }
 bytemuck = { version="1.20.0", features = ["derive"] }
 serde_json = "1.0.133"
 clap = { version = "3.0", features = ["derive"] }
+num = "0.4.3"

@@ -8,6 +8,7 @@ use procaddr2sym::{ProcAddr2Sym, SymInfo};
 use serde_json::Value;
 use clap::Parser;
 use std::cmp::max;
+use num::{Rational64, FromPrimitive, Zero};
 
 const RETURN_BIT: i32 = 63;
 const TAILCALL_BIT: i32 = 62;
@@ -76,6 +77,78 @@ struct ThreadTrace {
     trace: Vec<FunTraceEntry>,
 }
 
+struct FtraceEvent {
+    timestamp: u64,
+    line: String,
+}
+
+fn parse_ftrace_lines(input: &String, transform_timestamp: impl Fn(u64) -> String) -> Vec<FtraceEvent> {
+    let mut results = Vec::new();
+
+    for line in input.lines() {
+        // Find the timestamp section
+        if let Some(colon_pos) = line.find(": ") {
+            // Search backwards from colon to find the start of timestamp
+            if let Some(space_before_ts) = line[..colon_pos].rfind(char::is_whitespace) {
+                let timestamp_str = &line[space_before_ts + 1..colon_pos];
+
+                // Parse the timestamp
+                if let Ok(timestamp) = timestamp_str.parse::<u64>() {
+                    // Split line into parts
+                    let before_ts = &line[..space_before_ts + 1];
+                    let after_ts = &line[colon_pos..];
+
+                    // Create modified line with transformed timestamp
+                    let modified_line = format!(
+                        "{}{}{}",
+                        before_ts,
+                        transform_timestamp(timestamp),
+                        after_ts
+                    );
+
+                    results.push(FtraceEvent {
+                        timestamp,
+                        line: modified_line,
+                    });
+                }
+            }
+        }
+    }
+
+    results
+}
+
+fn rat2dec(rational: &Rational64, decimal_places: usize) -> String {
+    // Get numerator and denominator as BigInt
+    let numerator = rational.numer();
+    let denominator = rational.denom();
+    
+    // Perform division with extra precision to ensure accuracy
+    let mut quotient = numerator / denominator;
+    let mut remainder = numerator % denominator;
+    
+    // Build the decimal string
+    let mut result = quotient.to_string();
+    
+    if !remainder.is_zero() {
+        result.push('.');
+        
+        // Calculate decimal digits
+        for _ in 0..decimal_places {
+            remainder *= 10;
+            quotient = &remainder / denominator;
+            remainder = &remainder % denominator;
+            result.push_str(&quotient.to_string());
+            
+            if remainder.is_zero() {
+                break;
+            }
+        }
+    }
+    
+    result
+}
+
 impl TraceConverter {
     pub fn new(args: &Cli) -> Self {
         TraceConverter { procaddr2sym: ProcAddr2Sym::new(), source_cache: HashMap::new(), sym_cache: HashMap::new(),
@@ -83,7 +156,7 @@ impl TraceConverter {
             samples: args.samples.clone(), threads: args.threads.clone(), cpu_freq: 0, first_event_in_json: false }
     }
 
-    fn oldest_event(&self, sample_entries: &Vec<ThreadTrace>) -> Option<u64> {
+    fn oldest_event(&self, sample_entries: &Vec<ThreadTrace>, ftrace_events: &Vec<FtraceEvent>) -> u64 {
         if let Some(max_age) = self.max_event_age {
             let mut youngest = 0;
             for entries in sample_entries {
@@ -93,13 +166,16 @@ impl TraceConverter {
                     }
                 }
             }
-            Some(youngest - max_age)
+            for event in ftrace_events {
+                youngest = max(event.timestamp, youngest);
+            }
+            youngest - max_age
         }
         else if let Some(oldest) = self.oldest_event_time {
-            Some(oldest)
+            oldest
         }
         else {
-            None
+            0
         }
     }
 
@@ -107,13 +183,19 @@ impl TraceConverter {
         if self.dry {
             return Ok(());
         }
-        let cycles_per_us = 1000.;///1.;//FIXME self.cpu_freq as f64 / 1000000.0;
-    
-        // the redundant ph:X is needed to render the event on Perfetto's timeline, and pid:1
-        // for vizviewer --flamegraph to work
-        json.write(format!(r#"{}{{"tid":{},"ts":{:.4},"dur":{:.4},"name":{},"ph":"X","pid":{}}}"#, 
+        //using f64 would lose precision for machines with an uptime > month since f64 stores
+        //52 mantissa bits and TSC increments a couple billion times per second.
+        //we use rational numbers instead
+        let rat = |n: u64| Rational64::from_u64(n).unwrap();
+        let cycles_per_us = rat(self.cpu_freq) / rat(1000000);
+
+        let digits = 4; //Perfetto timeline has nanosecond precision - no point in printing
+        //more digits than 4 for the microsecond timestamps it expects in the JSON
+
+        // the redundant ph:X is needed to render the event on Perfetto's timeline
+        json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X","pid":{}}}"#, 
                     if self.first_event_in_json { "" } else { "\n," },
-                    thread_id.tid, call_cycle as f64/cycles_per_us, (return_cycle-call_cycle) as f64/cycles_per_us, json_name(call_sym), thread_id.pid).as_bytes())?; 
+                    thread_id.tid, rat2dec(&(rat(call_cycle)/cycles_per_us.clone()), digits), rat2dec(&(rat(return_cycle-call_cycle)/cycles_per_us), digits), json_name(call_sym), thread_id.pid).as_bytes())?; 
     
         self.first_event_in_json = false;
         funcset.insert(call_sym.clone());
@@ -132,7 +214,7 @@ impl TraceConverter {
         Ok(())
     }
 
-    fn write_sample_to_json(&mut self, fname: &String, sample_entries: &Vec<ThreadTrace>) -> io::Result<()> {
+    fn write_sample_to_json(&mut self, fname: &String, sample_entries: &Vec<ThreadTrace>, ftrace_text: &String) -> io::Result<()> {
         let mut json = if self.dry { File::open("/dev/null")? } else { File::create(fname)? };
         if !self.dry {
             json.write(br#"{
@@ -152,7 +234,17 @@ impl TraceConverter {
         self.first_event_in_json = true;
         let mut ignore_addrs: HashSet<u64> = HashSet::new();
     
-        let oldest = self.oldest_event(sample_entries);
+        let rat = |n: u64| Rational64::from_u64(n).unwrap();
+        //ftrace timestamps are supposed to be in seconds; CPU frequency is in TSC cycles per second;
+        //so dividing by frequency will convert TSC to seconds. Perfetto timeline accuracy is ns
+        //hence 10 digits after '.'
+        let cycles_per_second = rat(self.cpu_freq);
+        let fixts = |ts: u64| format!("{}", rat2dec(&(rat(ts)/cycles_per_second), 10));
+        let mut ftrace_events = parse_ftrace_lines(ftrace_text, fixts);
+
+        let oldest = self.oldest_event(sample_entries, &ftrace_events);
+
+        ftrace_events.retain(|event| event.timestamp >= oldest);
     
         let cycles_per_ns = (self.cpu_freq as f64 / 1000000000.0 + 1.) as u64;
     
@@ -164,18 +256,13 @@ impl TraceConverter {
             }
             let mut stack: Vec<FunTraceEntry> = Vec::new();
             let mut num_events = 0;
-            let mut earliest_cycle = entries[0].cycle;
-            if let Some(oldest_cycle) = oldest {
-                earliest_cycle = max(earliest_cycle, oldest_cycle);
-            } 
+            let earliest_cycle = max(entries[0].cycle, oldest);
             let latest_cycle = entries[entries.len()-1].cycle;
             let mut num_orphan_returns = 0;
     
             for entry in entries {
-                if let Some(oldest_cycle) = oldest {
-                    if oldest_cycle > entry.cycle {
-                        continue; //ignore old events
-                    }
+                if oldest > entry.cycle {
+                    continue; //ignore old events
                 }
                 let ret = (entry.address >> RETURN_BIT) != 0;
                 let tailcall = ((entry.address >> TAILCALL_BIT) & 1) != 0;
@@ -277,6 +364,21 @@ impl TraceConverter {
         }
     
         json.write(b"],\n")?;
+
+        if !ftrace_events.is_empty() {
+            let joined: String = ftrace_events.iter().map(|e| e.line.clone() + "\n").collect();
+
+            json.write(br#""systemTraceEvents": "#)?;
+            //# tracer: nop is something Perfetto doesn't seem to need but the Chromium trace
+            //JSON spec insists is a must
+            json.write(Value::String("# tracer: nop\n".to_string() + &joined).to_string().as_bytes())?;
+            json.write(b",\n")?;
+
+            let oldest_ftrace = ftrace_events[0].timestamp;
+            let newest_ftrace = ftrace_events[ftrace_events.len()-1].timestamp;
+            println!("  ftrace - {} events logged over {} cycles [{} - {}]", ftrace_events.len(), newest_ftrace-oldest_ftrace, oldest_ftrace, newest_ftrace);
+        }
+
         // find the source files containing the functions in this sample's set
         let mut fileset: HashSet<String> = HashSet::new();
         for sym in funcset.iter() {
@@ -326,6 +428,8 @@ impl TraceConverter {
 
         let mut thread_id = ThreadID { pid: 0, tid: 0 };
 
+        let mut ftrace_text = "".to_string();
+
         loop {
             //the file consists of chunks with an 8-byte magic string telling the chunk
             //type, followed by an 8-byte length field and then contents of that length
@@ -354,15 +458,16 @@ impl TraceConverter {
                     file.seek(SeekFrom::Current(chunk_length as i64))?;
                     continue;
                 }
-                if !sample_entries.is_empty() {
+                if !sample_entries.is_empty() || !ftrace_text.is_empty() {
                     if self.samples.is_empty() || self.samples.contains(&num_json) {
-                        self.write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries)?;
+                        self.write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &ftrace_text)?;
                     }
                     else {
                         println!("ignoring sample {} - not on the list {:?}", num_json, self.samples);
                     }
                     num_json += 1;
                     sample_entries.clear();
+                    ftrace_text.clear();
                 }
             }
             else if &magic == b"PROCMAPS" {
@@ -396,14 +501,18 @@ impl TraceConverter {
                     entries.trace.sort_by_key(|entry| entry.cycle);
                     sample_entries.push(entries);
                 }
+            } else if &magic == b"FTRACETX" {
+                let mut ftrace_bytes = vec![0u8; chunk_length];
+                file.read_exact(&mut ftrace_bytes)?;
+                ftrace_text = String::from_utf8(ftrace_bytes).unwrap();
             } else {
                 println!("Unknown chunk type: {:?}", std::str::from_utf8(&magic).unwrap_or("<invalid>"));
                 file.seek(SeekFrom::Current(chunk_length as i64))?;
             }
         }
-        if !sample_entries.is_empty() {
+        if !sample_entries.is_empty() || !ftrace_text.is_empty() {
             println!("warning: FUNTRACE block not closed by ENDTRACE");
-            self.write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries)?;
+            self.write_sample_to_json(&format_json_filename(json_basename, num_json), &sample_entries, &ftrace_text)?;
         }
     
         Ok(())
