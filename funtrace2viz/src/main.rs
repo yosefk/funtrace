@@ -61,7 +61,9 @@ struct TraceConverter {
     samples: Vec<u32>,
     threads: Vec<u64>,
     cpu_freq: u64,
+    cmd_line: String,
     first_event_in_json: bool,
+    first_event_in_thread: bool,
 }
 
 #[repr(C)]
@@ -70,6 +72,7 @@ struct ThreadID
 {
     pid: u64,
     tid: u64,
+    name: [u8; 16],
 }
 
 struct ThreadTrace {
@@ -153,7 +156,9 @@ impl TraceConverter {
     pub fn new(args: &Cli) -> Self {
         TraceConverter { procaddr2sym: ProcAddr2Sym::new(), source_cache: HashMap::new(), sym_cache: HashMap::new(),
             max_event_age: args.max_event_age, oldest_event_time: args.oldest_event_time, dry: args.dry,
-            samples: args.samples.clone(), threads: args.threads.clone(), cpu_freq: 0, first_event_in_json: false }
+            samples: args.samples.clone(), threads: args.threads.clone(), cpu_freq: 0, cmd_line: "".to_string(),
+            first_event_in_json: false, first_event_in_thread: false
+        }
     }
 
     fn oldest_event(&self, sample_entries: &Vec<ThreadTrace>, ftrace_events: &Vec<FtraceEvent>) -> u64 {
@@ -183,6 +188,19 @@ impl TraceConverter {
         if self.dry {
             return Ok(());
         }
+        if self.first_event_in_thread {
+            let name: Vec<_> = thread_id.name.iter().filter(|&&x| x != 0 as u8).copied().collect();
+            json.write(format!(r#"{}{{"ph":"M","pid":{},"tid":{},"name":"thread_name","args":{{"name":{}}}}}"#,
+                        if self.first_event_in_json { "" } else { "\n," },
+                        thread_id.pid,thread_id.tid,Value::String(String::from_utf8(name.to_vec()).unwrap()).to_string()).as_bytes())?;
+            self.first_event_in_thread = false;
+            self.first_event_in_json = false;
+
+            if thread_id.pid == thread_id.tid {
+                json.write(format!(r#"{}{{"ph":"M","pid":{},"tid":{},"name":"process_name","args":{{"name":{}}}}}"#, "\n,",
+                        thread_id.pid,thread_id.tid,Value::String(self.cmd_line.clone()).to_string()).as_bytes())?;
+            }
+        }
         //using f64 would lose precision for machines with an uptime > month since f64 stores
         //52 mantissa bits and TSC increments a couple billion times per second.
         //we use rational numbers instead
@@ -193,11 +211,9 @@ impl TraceConverter {
         //more digits than 4 for the microsecond timestamps it expects in the JSON
 
         // the redundant ph:X is needed to render the event on Perfetto's timeline
-        json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X","pid":{}}}"#, 
-                    if self.first_event_in_json { "" } else { "\n," },
+        json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X","pid":{}}}"#, "\n,",
                     thread_id.tid, rat2dec(&(rat(call_cycle)/cycles_per_us.clone()), digits), rat2dec(&(rat(return_cycle-call_cycle)/cycles_per_us), digits), json_name(call_sym), thread_id.pid).as_bytes())?; 
     
-        self.first_event_in_json = false;
         funcset.insert(call_sym.clone());
     
         //cache the source code if it's the first time we see this file
@@ -259,6 +275,7 @@ impl TraceConverter {
             let earliest_cycle = max(entries[0].cycle, oldest);
             let latest_cycle = entries[entries.len()-1].cycle;
             let mut num_orphan_returns = 0;
+            self.first_event_in_thread = true;
     
             for entry in entries {
                 if oldest > entry.cycle {
@@ -426,7 +443,7 @@ impl TraceConverter {
         let mut sample_entries: Vec<ThreadTrace> = Vec::new();
         let mut num_json = 0;
 
-        let mut thread_id = ThreadID { pid: 0, tid: 0 };
+        let mut thread_id = ThreadID { pid: 0, tid: 0, name: [0; 16] };
 
         let mut ftrace_text = "".to_string();
 
@@ -451,6 +468,11 @@ impl TraceConverter {
                 let mut freq_bytes = [0u8; 8];
                 file.read_exact(&mut freq_bytes)?;
                 self.cpu_freq = u64::from_ne_bytes(freq_bytes);
+            }
+            else if &magic == b"CMD LINE" {
+                let mut cmd_bytes = vec![0u8; chunk_length];
+                file.read_exact(&mut cmd_bytes)?;
+                self.cmd_line = String::from_utf8(cmd_bytes).unwrap();
             }
             else if &magic == b"ENDTRACE" {
                 if chunk_length != 0 {
@@ -479,8 +501,8 @@ impl TraceConverter {
                 //the symbol cache might have been invalidated if the process unloaded and reloaded a shared object
                 self.sym_cache = HashMap::new();
             } else if &magic == b"THREADID" {
-                if chunk_length != 16 {
-                    println!("Unexpected THREAD chunk length {} - expecting 16", chunk_length);
+                if chunk_length != std::mem::size_of::<ThreadID>() {
+                    println!("Unexpected THREAD chunk length {} - expecting {}", chunk_length, std::mem::size_of::<ThreadID>());
                     file.seek(SeekFrom::Current(chunk_length as i64))?;
                     continue;
                 }
