@@ -192,7 +192,7 @@ impl TraceConverter {
             let name: Vec<_> = thread_id.name.iter().filter(|&&x| x != 0 as u8).copied().collect();
             json.write(format!(r#"{}{{"ph":"M","pid":{},"tid":{},"name":"thread_name","args":{{"name":{}}}}}"#,
                         if self.first_event_in_json { "" } else { "\n," },
-                        thread_id.pid,thread_id.tid,Value::String(String::from_utf8(name.to_vec()).unwrap()).to_string()).as_bytes())?;
+                        thread_id.pid,thread_id.tid,Value::String(String::from_utf8(name).unwrap()).to_string()).as_bytes())?;
             self.first_event_in_thread = false;
             self.first_event_in_json = false;
 
@@ -236,10 +236,10 @@ impl TraceConverter {
             json.write(br#"{
 "traceEvents": [
 "#)?;
-            println!("decoding a trace sample into {}...", fname);
+            println!("decoding a trace sample logged by `{}` into {}...", self.cmd_line, fname);
         }
         else {
-            println!("inspecting sample {} (without creating the file...)", fname);
+            println!("inspecting sample {} logged by `{}` (without creating the file...)", fname, self.cmd_line);
         }
     
         // we list the set of functions (to tell their file, line pair to vizviewer);
@@ -369,11 +369,12 @@ impl TraceConverter {
 
                 }
             }
+            let name = String::from_utf8(thread_trace.thread_id.name.iter().filter(|&&x| x != 0 as u8).copied().collect()).unwrap();
             if latest_cycle >= earliest_cycle {
-                println!("  thread {} - {} recent function calls logged over {} cycles [{} - {}]", thread_trace.thread_id.tid, num_events, latest_cycle-earliest_cycle, earliest_cycle, latest_cycle);
+                println!("  thread {} {} - {} recent function calls logged over {} cycles [{} - {}]", thread_trace.thread_id.tid, name, num_events, latest_cycle-earliest_cycle, earliest_cycle, latest_cycle);
             }
             else {
-                println!("    skipping a thread (all {} logged function entry/return events are too old)", entries.len());
+                println!("    skipping thread {} {} (all {} logged function entry/return events are too old)", thread_trace.thread_id.tid, name, entries.len());
             }
         }
         if self.dry {

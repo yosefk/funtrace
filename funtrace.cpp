@@ -173,8 +173,10 @@ static std::string NOINSTR get_cmdline()
         }
     }
     
-    return std::string(buffer.begin(), buffer.end());
+    return std::string(buffer.begin(), buffer.end()-1); //-1 for the last null
 }
+
+static uint64_t cpu_cycles_per_second();
 
 struct trace_global_state
 {
@@ -188,11 +190,13 @@ struct trace_global_state
     //which might come from multiple threads)
     uint64_t pid;
     std::string cmdline;
+    uint64_t cpu_freq;
 
     NOINSTR trace_global_state()
     {
         pid = getpid();
         cmdline = get_cmdline();
+        cpu_freq = cpu_cycles_per_second();
     }
     NOINSTR ~trace_global_state() {}
 
@@ -299,7 +303,7 @@ static uint64_t NOINSTR get_tsc_freq(void) {
     }
 }
 
-static uint64_t cpu_cycles_per_second()
+static uint64_t NOINSTR cpu_cycles_per_second()
 {
     uint64_t freq = 0;
     freq = get_tsc_freq();
@@ -320,11 +324,7 @@ static uint64_t cpu_cycles_per_second()
     return freq;
 }
 
-//we need this as a global variable for funtrace_gdb.py which might not run on the same CPU
-//as the core dump it is used on
-uint64_t g_funtrace_cpu_freq = cpu_cycles_per_second();
-
-extern "C" uint64_t NOINSTR funtrace_ticks_per_second() { return g_funtrace_cpu_freq; }
+extern "C" uint64_t NOINSTR funtrace_ticks_per_second() { return g_trace_state.cpu_freq; }
 
 struct funtrace_procmaps
 {
@@ -357,7 +357,7 @@ struct event_buffer
 
 static void NOINSTR write_funtrace(std::ostream& file)
 {
-    write_chunk(file, "FUNTRACE", &g_funtrace_cpu_freq, sizeof g_funtrace_cpu_freq);
+    write_chunk(file, "FUNTRACE", &g_trace_state.cpu_freq, sizeof g_trace_state.cpu_freq);
     write_chunk(file, "CMD LINE", g_trace_state.cmdline.c_str(), g_trace_state.cmdline.size());
 }
 
