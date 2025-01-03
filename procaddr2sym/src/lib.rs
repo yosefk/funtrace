@@ -198,6 +198,20 @@ fn time2str(time: &SystemTime) -> String {
     datetime.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+//sometimes you will see function names like "f(int) [clone .constprop.1]"
+//or "f(int) [clone .cold]", due to the compiler generating multiple copies of the code for various reasons.
+//we strip this "[clone .whatever]" stuff, not only because it's not too helpful for human users,
+//but because it actively interferes with eg exception handling (when throw/catch return us to "f() [clone .cold]"
+//we need to know that it's the same as the "f()" we have on our stack to be able to pop f's callees from the stack;
+//we don't want "[clone .cold]" to throw us off)
+fn strip_clone(input: String) -> String {
+    if let Some(index) = input.find(" [clone ") {
+        input[..index].to_string()
+    } else {
+        input
+    }
+}
+
 impl ProcAddr2Sym {
     pub fn new() -> Self {
         ProcAddr2Sym { maps: Vec::new(), sym_cache: HashMap::new(), sym_missing: HashSet::new(), offset_cache: HashMap::new(), source_files: HashSet::new(),
@@ -350,6 +364,6 @@ impl ProcAddr2Sym {
                 }
             }
         }
-        SymInfo{func:name, demangled_func, file, line:linenum, executable_file:pathstr, static_addr}
+        SymInfo{func:strip_clone(name), demangled_func:strip_clone(demangled_func), file, line:linenum, executable_file:pathstr, static_addr}
     }
 }

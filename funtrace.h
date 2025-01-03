@@ -84,6 +84,12 @@ void funtrace_ignore_this_thread();
 void funtrace_disable_tracing();
 void funtrace_enable_tracing();
 
+#ifdef __clang__
+#define NOFUNTRACE __attribute__((xray_never_instrument))
+#else
+#define NOFUNTRACE __attribute__((no_instrument_function))
+#endif
+
 #ifdef __cplusplus
 }
 #endif

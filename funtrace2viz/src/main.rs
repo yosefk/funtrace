@@ -12,9 +12,12 @@ use num::{Rational64, FromPrimitive, Zero};
 
 const RETURN_BIT: i32 = 63;
 const TAILCALL_BIT: i32 = 62;
+const CATCH_BIT: i32 = 61;
+const ADDRESS_MASK: u64 = !((1<<RETURN_BIT)|(1<<TAILCALL_BIT)|(1<<CATCH_BIT));
 const MAGIC_LEN: usize = 8;
 const LENGTH_LEN: usize = 8;
 
+fn bit_set(n: u64, b: i32) -> bool { ((n>>b)&1) != 0 }
 
 // Struct to represent a 16-byte FUNTRACE entry
 #[repr(C)]
@@ -284,9 +287,10 @@ impl TraceConverter {
                 if oldest > entry.cycle {
                     continue; //ignore old events
                 }
-                let ret = (entry.address >> RETURN_BIT) != 0;
-                let tailcall = ((entry.address >> TAILCALL_BIT) & 1) != 0;
-                let addr = entry.address & !((1<<RETURN_BIT) | (1<<TAILCALL_BIT));
+                let ret = bit_set(entry.address, RETURN_BIT);
+                let tailcall = bit_set(entry.address, TAILCALL_BIT);
+                let catch = bit_set(entry.address, CATCH_BIT);
+                let addr = entry.address & ADDRESS_MASK;
                 if !self.sym_cache.contains_key(&addr) {
                     let sym = self.procaddr2sym.proc_addr2sym(addr);
                     //we ignore "virtual override thunks" because they aren't interesting
@@ -301,7 +305,30 @@ impl TraceConverter {
                 if ignore_addrs.contains(&addr) {
                     continue;
                 }
-                //println!("ret {} sym {}", ret, json_name(sym_cache.get(&addr).unwrap()));
+                //println!("ret {} catch {} sym {}", ret, catch, json_name(self.sym_cache.get(&addr).unwrap()));
+                if catch {
+                    //pop the entries on the stack until we find the function which logged the catch entry.
+                    //if we don't find it, perhaps its call entry didn't make it into our trace, or, more
+                    //troublingly, it was compiled without instrumentation or something else went wrong which
+                    //will cause us to pop everything from the stack. but resetting the stack upon a catch
+                    //is probably less bad than leaving it as is since then it would keep growing with
+                    //every catch
+                    let catcher = self.sym_cache.get(&addr).unwrap().demangled_func.clone();
+                    let mut unwound = 0;
+                    while !stack.is_empty() {
+                        let last = stack.last().unwrap();
+                        let call_sym = self.sym_cache.get(&last.address).unwrap();
+                        if catcher == call_sym.demangled_func { //we don't compare by address since it could be two
+                            //different symbols - we entered "f(int)" and we are catching inside "f(int) [clone .cold]";
+                            //procaddr2sym strips the [clone...] from the name so we can compare by it
+                            break;
+                        }
+                        self.write_function_call_event(&mut json, &call_sym.clone(), last.cycle, entry.cycle + cycles_per_ns*unwound, &thread_trace.thread_id, &mut funcset)?;
+                        stack.pop();
+                        unwound += 1;
+                    }
+                    continue;
+                }
                 if !ret && !tailcall {
                     stack.push(*entry);
                 }
@@ -322,10 +349,10 @@ impl TraceConverter {
                     }
                     else {
                         let call_entry = stack.pop().unwrap();
-                        if (call_entry.address & (1<<TAILCALL_BIT)) != 0 {
+                        if bit_set(call_entry.address, TAILCALL_BIT) {
                             println!("WARNING: a non-orphan tailcall popped from the stack, expected a call?..");
                         }
-                        (call_entry.cycle, call_entry.address)
+                        (call_entry.cycle, call_entry.address & ADDRESS_MASK)
                     };
                     if tailcall {
                         //a tailcall from f to g means we won't ever see a return event from f - instead,
@@ -345,7 +372,7 @@ impl TraceConverter {
                     //this "shouldn't happen" but it does unless we ignore "virtual override thunks"
                     //and it's good to at least emit a warning when it does since the trace will look strange
                     let ret_sym = self.sym_cache.get(&addr).unwrap();
-                    //FIXME: adapt the warning for XRay
+                    //FIXME: adapt the warning for XRay; compare names, not addresses??? think...
                     if false && ret_sym.static_addr != call_sym.static_addr {
                         println!("      WARNING: call/return mismatch - {} called, {} returning", json_name(call_sym), json_name(ret_sym));
                         println!("      call stack after the return:");
@@ -358,9 +385,9 @@ impl TraceConverter {
                     num_events += 1;
                     self.write_function_call_event(&mut json, &call_sym.clone(), call_cycle, entry.cycle, &thread_trace.thread_id, &mut funcset)?;
                     let mut returns = 1;
-                    while !stack.is_empty() && (stack.last().unwrap().address & (1<<TAILCALL_BIT)) != 0 {
+                    while !stack.is_empty() && bit_set(stack.last().unwrap().address, TAILCALL_BIT) {
                         let last = stack.pop().unwrap();
-                        let tailcall_addr = last.address & !(1<<TAILCALL_BIT);
+                        let tailcall_addr = last.address & ADDRESS_MASK;
                         let call_sym = self.sym_cache.get(&tailcall_addr).unwrap();
                         num_events += 1;
                         //we (or rather the Perfetto JSON spec) want perfect nesting, so we make sure there's an ns latency between the timestmaps
