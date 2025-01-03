@@ -8,8 +8,11 @@ use std::rc::Rc;
 use procfs::process::{MemoryMaps, MemoryMap, MMapPath};
 use procfs::FromBufRead;
 use goblin::elf::{Elf, ProgramHeader};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::SystemTime;
 use std::fs::File;
+use std::fs;
+use chrono::{DateTime, Local};
 use memmap2::Mmap;
 use cpp_demangle;
 
@@ -95,10 +98,21 @@ struct ExecutableFileMetadata
     symbols: Vec<Symbol>,
 }
 
+pub struct InputSource {
+    path: String,
+    modified: SystemTime,
+}
+
+pub fn input_source(path: String) -> InputSource {
+    InputSource { path: path.clone(), modified: fs::metadata(path).unwrap().modified().unwrap() }
+}
+
 pub struct ProcAddr2Sym {
     maps: Vec<MemoryMap>,
     sym_cache: HashMap<String, ExecutableFileMetadata>,
     offset_cache: HashMap<u64, u64>,
+    source_files: HashSet<String>, //kept just to print "modified after the input source" warnings once per file
+    pub input_source: Option<InputSource>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, std::cmp::Eq)]
@@ -119,9 +133,14 @@ pub struct SymInfo {
     //directly corresponding to the input dynamic address
 }
 
+fn time2str(time: &SystemTime) -> String {
+    let datetime: DateTime<Local> = (*time).into();
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 impl ProcAddr2Sym {
     pub fn new() -> Self {
-        ProcAddr2Sym { maps: Vec::new(), sym_cache: HashMap::new(), offset_cache: HashMap::new() }
+        ProcAddr2Sym { maps: Vec::new(), sym_cache: HashMap::new(), offset_cache: HashMap::new(), source_files: HashSet::new(), input_source: None }
     }
 
     // note that updating the maps doesn't invalidate sym_cache - we don't need to parse
@@ -152,6 +171,12 @@ impl ProcAddr2Sym {
         let pathstr = path.to_string_lossy().to_string();
         if !self.sym_cache.contains_key(&pathstr) {
             let file = File::open(path).expect("failed to open executable file");
+            if let Some(ref input_source) = self.input_source {
+                let modified = fs::metadata(path).expect("failed to stat file").modified().expect("failed to get last modification timestamp");
+                if modified > input_source.modified {
+                    println!("WARNING: executable file {} last modified at {} - later than {} ({})", pathstr, time2str(&modified), input_source.path, time2str(&input_source.modified)); 
+                }
+            }
             let buffer = unsafe { Mmap::map(&file).expect("failed to mmap executable file") };
             let elf = Elf::parse(&buffer).expect("Failed to parse ELF");
             let symbols = read_elf_symbols(&elf);
@@ -198,6 +223,22 @@ impl ProcAddr2Sym {
             Ok(Some(location)) => (location.file.unwrap_or("??"), location.line.unwrap_or(0)),
             _ => ("??",0),
         };
+        if let Some(ref input_source) = self.input_source {
+            let file = file.to_string().clone();
+            if !self.source_files.contains(&file) {
+            //don't warn if we can't access the file (maybe the source code isn't supposed to be
+            //on this machine or it's a relative path or whatever); do warn if we can access it and it's newer than the data
+            //source - very likely a mistake the user should be aware of
+                if let Ok(meta) = fs::metadata(file.clone()) {
+                    if let Ok(modified) = meta.modified() {
+                        if modified > input_source.modified {
+                            println!("WARNING: source file {} last modified at {} - later than {} ({})", file, time2str(&modified), input_source.path, time2str(&input_source.modified)); 
+                        }
+                    }
+                }
+                self.source_files.insert(file);
+            }
+        }
 
         if !name_found {
             //not sure if we are ever going to meet a case where there's no ELF symbol name

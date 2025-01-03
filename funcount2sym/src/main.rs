@@ -44,7 +44,9 @@ fn main() {
     if !found { fail!("COUNTS magic string not found"); }
     line.clear();
 
+    let input_source = Some(procaddr2sym::input_source(args[1].to_string()));
     let mut procaddr2sym = ProcAddr2Sym::new();
+    procaddr2sym.input_source = input_source;
     procaddr2sym.set_proc_maps(proc_maps_data.as_bytes());
 
     while reader.read_line(&mut line).expect("failure reading input file") > 0 {

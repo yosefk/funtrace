@@ -448,6 +448,8 @@ impl TraceConverter {
 
         let mut ftrace_text = "".to_string();
 
+        self.procaddr2sym.input_source = Some(procaddr2sym::input_source(file_path.clone()));
+
         loop {
             //the file consists of chunks with an 8-byte magic string telling the chunk
             //type, followed by an 8-byte length field and then contents of that length
