@@ -222,6 +222,9 @@ impl TraceConverter {
             if let Ok(mut source_file) = File::open(&call_sym.file) {
                 source_file.read_to_end(&mut source_code)?;
             }
+            else if call_sym.file != "??" {
+                println!("WARNING: couldn't open source file {} - you can remap paths using a substitute-path.json file in your working directory", call_sym.file);
+            }
             let json_str = Value::String(String::from_utf8(source_code.clone()).unwrap()).to_string();
             let num_lines = source_code.iter().filter(|&&b| b == b'\n').count(); //TODO: num newlines
             //might be off by one relatively to num lines...

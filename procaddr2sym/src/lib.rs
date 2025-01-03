@@ -11,9 +11,11 @@ use goblin::elf::{Elf, ProgramHeader};
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 use std::fs::File;
+use std::io::Read;
 use std::fs;
 use chrono::{DateTime, Local};
 use memmap2::Mmap;
+use serde_json::Value;
 use cpp_demangle;
 
 fn find_address_in_maps(address: u64, maps: &Vec<MemoryMap>) -> Option<&MemoryMap> {
@@ -91,6 +93,62 @@ fn find_symbol(symbols: &Vec<Symbol>, address: u64) -> Option<&Symbol> {
     }
 }
 
+#[derive(Debug)]
+struct SubsPath {
+    src: String,
+    dst: String,
+}
+
+fn parse_substitute_path_json(file_name: &str) -> Vec<SubsPath> {
+    let mut file = match File::open(file_name) {
+        Ok(file) => file,
+        Err(_) => {
+            return Vec::new();
+        }
+    };
+
+    let mut json_str = String::new();
+    if let Err(e) = file.read_to_string(&mut json_str) {
+        eprintln!("Warning: Failed to read from file '{}': {}", file_name, e);
+        return Vec::new();
+    }
+
+    let json_value: Value = match serde_json::from_str(&json_str) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("Warning: Failed to parse JSON in file '{}': {}", file_name, e);
+            return Vec::new();
+        }
+    };
+
+    let mut subs_paths = Vec::new();
+
+    if let Some(array) = json_value.as_array() {
+        for item in array {
+            if let Some(inner_array) = item.as_array() {
+                if inner_array.len() == 2 {
+                    if let (Some(src), Some(dst)) = (inner_array[0].as_str(), inner_array[1].as_str()) {
+                        subs_paths.push(SubsPath {
+                            src: src.to_string(),
+                            dst: dst.to_string(),
+                        });
+                    } else {
+                        eprintln!("Warning: Invalid string pair in file '{}'", file_name);
+                    }
+                } else {
+                    eprintln!("Warning: Array does not contain exactly 2 elements in file '{}'", file_name);
+                }
+            } else {
+                eprintln!("Warning: Expected array in file '{}'", file_name);
+            }
+        }
+    } else {
+        eprintln!("Warning: Top level object is not an array in file '{}'", file_name);
+    }
+
+    subs_paths
+}
+
 struct ExecutableFileMetadata
 {
     program_headers: Vec<ProgramHeader>,
@@ -110,8 +168,10 @@ pub fn input_source(path: String) -> InputSource {
 pub struct ProcAddr2Sym {
     maps: Vec<MemoryMap>,
     sym_cache: HashMap<String, ExecutableFileMetadata>,
+    sym_missing: HashSet<String>,
     offset_cache: HashMap<u64, u64>,
     source_files: HashSet<String>, //kept just to print "modified after the input source" warnings once per file
+    subs_path: Vec<SubsPath>,
     pub input_source: Option<InputSource>,
 }
 
@@ -140,7 +200,16 @@ fn time2str(time: &SystemTime) -> String {
 
 impl ProcAddr2Sym {
     pub fn new() -> Self {
-        ProcAddr2Sym { maps: Vec::new(), sym_cache: HashMap::new(), offset_cache: HashMap::new(), source_files: HashSet::new(), input_source: None }
+        ProcAddr2Sym { maps: Vec::new(), sym_cache: HashMap::new(), sym_missing: HashSet::new(), offset_cache: HashMap::new(), source_files: HashSet::new(),
+            subs_path: parse_substitute_path_json("substitute-path.json"), input_source: None }
+    }
+
+    fn substitute_path(&self, path: String) -> String {
+        let mut s = path;
+        for subs in &self.subs_path {
+            s = s.replace(&subs.src, &subs.dst);
+        }
+        s
     }
 
     // note that updating the maps doesn't invalidate sym_cache - we don't need to parse
@@ -168,11 +237,20 @@ impl ProcAddr2Sym {
         if path_opt == None { return unknown; }
         let path = path_opt.unwrap();
 
-        let pathstr = path.to_string_lossy().to_string();
+        let pathstr = self.substitute_path(path.to_string_lossy().to_string());
+        if self.sym_missing.contains(&pathstr) {
+            return unknown;
+        }
         if !self.sym_cache.contains_key(&pathstr) {
-            let file = File::open(path).expect("failed to open executable file");
+            let fileopt = File::open(pathstr.clone());
+            if fileopt.is_err() {
+                println!("WARNING: couldn't open executable file {} - you can remap paths using a substitute-path.json file in your working directory", pathstr);
+                self.sym_missing.insert(pathstr);
+                return unknown;
+            }
+            let file = fileopt.unwrap();
             if let Some(ref input_source) = self.input_source {
-                let modified = fs::metadata(path).expect("failed to stat file").modified().expect("failed to get last modification timestamp");
+                let modified = fs::metadata(pathstr.clone()).expect("failed to stat file").modified().expect("failed to get last modification timestamp");
                 if modified > input_source.modified {
                     println!("WARNING: executable file {} last modified at {} - later than {} ({})", pathstr, time2str(&modified), input_source.path, time2str(&input_source.modified)); 
                 }
@@ -183,7 +261,7 @@ impl ProcAddr2Sym {
             let program_headers = elf.program_headers.clone();
             let object = object::File::parse(&*buffer).expect("Failed to parse ELF");
             let ctx = addr2line::Context::new(&object).expect("Failed to create addr2line context");
-            self.sym_cache.insert(path.to_string_lossy().to_string(), ExecutableFileMetadata { program_headers, addr2line: ctx, symbols });
+            self.sym_cache.insert(pathstr.clone(), ExecutableFileMetadata { program_headers, addr2line: ctx, symbols });
         }
         let meta = self.sym_cache.get(&pathstr).unwrap();
 
@@ -223,12 +301,13 @@ impl ProcAddr2Sym {
             Ok(Some(location)) => (location.file.unwrap_or("??"), location.line.unwrap_or(0)),
             _ => ("??",0),
         };
+        let file = self.substitute_path(file.to_string());
         if let Some(ref input_source) = self.input_source {
-            let file = file.to_string().clone();
+            let file = file.clone();
             if !self.source_files.contains(&file) {
-            //don't warn if we can't access the file (maybe the source code isn't supposed to be
-            //on this machine or it's a relative path or whatever); do warn if we can access it and it's newer than the data
-            //source - very likely a mistake the user should be aware of
+                //don't warn if we can't access the file (maybe the source code isn't supposed to be
+                //on this machine or it's a relative path or whatever); do warn if we can access it and it's newer than the data
+                //source - very likely a mistake the user should be aware of
                 if let Ok(meta) = fs::metadata(file.clone()) {
                     if let Ok(modified) = meta.modified() {
                         if modified > input_source.modified {
@@ -271,6 +350,6 @@ impl ProcAddr2Sym {
                 }
             }
         }
-        SymInfo{func:name, demangled_func, file:file.to_string(), line:linenum, executable_file:pathstr, static_addr}
+        SymInfo{func:name, demangled_func, file, line:linenum, executable_file:pathstr, static_addr}
     }
 }
