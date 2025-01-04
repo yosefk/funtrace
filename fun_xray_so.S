@@ -20,35 +20,35 @@
 // which it shouldn't (which doesn't happen under -O3 but we don't want to
 // take chances on this - these are not normal function calls that can rely
 // on the calling convention)
-	.text
-	.hidden	__xray_FunctionEntry
-	.globl	__xray_FunctionEntry
-	.p2align	4
-	.type	__xray_FunctionEntry,@function
+        .text
+        .hidden __xray_FunctionEntry
+        .globl  __xray_FunctionEntry
+        .p2align        4
+        .type   __xray_FunctionEntry,@function
 __xray_FunctionEntry:
-	.cfi_startproc
-	jmp	exe_xray_FunctionEntry@PLT
-	.cfi_endproc
-	.size	__xray_FunctionEntry, .-__xray_FunctionEntry
+        .cfi_startproc
+        jmp     exe_xray_FunctionEntry@PLT
+        .cfi_endproc
+        .size   __xray_FunctionEntry, .-__xray_FunctionEntry
 
-	.hidden	__xray_FunctionExit
-	.globl	__xray_FunctionExit
-	.p2align	4
-	.type	__xray_FunctionExit,@function
+        .hidden __xray_FunctionExit
+        .globl  __xray_FunctionExit
+        .p2align        4
+        .type   __xray_FunctionExit,@function
 __xray_FunctionExit:
-	.cfi_startproc
-	jmp	exe_xray_FunctionExit@PLT
-	.cfi_endproc
-	.size	__xray_FunctionExit, .-__xray_FunctionExit
+        .cfi_startproc
+        jmp     exe_xray_FunctionExit@PLT
+        .cfi_endproc
+        .size   __xray_FunctionExit, .-__xray_FunctionExit
 
-	.hidden	__xray_FunctionTailExit
-	.globl	__xray_FunctionTailExit
-	.p2align	4
-	.type	__xray_FunctionTailExit,@function
+        .hidden __xray_FunctionTailExit
+        .globl  __xray_FunctionTailExit
+        .p2align        4
+        .type   __xray_FunctionTailExit,@function
 __xray_FunctionTailExit:
-	.cfi_startproc
-	jmp	exe_xray_FunctionTailExit@PLT
-	.cfi_endproc
-	.size	__xray_FunctionTailExit, .-__xray_FunctionTailExit
+        .cfi_startproc
+        jmp     exe_xray_FunctionTailExit@PLT
+        .cfi_endproc
+        .size   __xray_FunctionTailExit, .-__xray_FunctionTailExit
 
 

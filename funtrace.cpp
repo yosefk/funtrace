@@ -31,7 +31,6 @@
 //put NOINSTR on them...
 #define NOINSTR NOFUNTRACE
 
-const int funtrace_buf_size = FUNTRACE_BUF_SIZE; //for debug info
 //(#define macros aren't visible with plain -g and need fancier flags that most
 //build systems don't pass; and FUNTRACE_BUF_SIZE must be a #define
 //to be useable from funtrace_pg.s)
@@ -92,7 +91,7 @@ struct trace_data
 
 inline void NOINSTR trace_data::trace(void* ptr, uint64_t flags)
 {
-    static_assert(sizeof(trace_entry) == 16);
+    static_assert(sizeof(trace_entry) == 16, "funtrace_pg.S assumes 16 byte trace_entry structs");
 
     bool paused = !enabled;
     trace_entry* entry = pos;
@@ -187,6 +186,7 @@ struct trace_global_state
     uint64_t pid;
     std::string cmdline;
     uint64_t cpu_freq;
+    int buf_size = FUNTRACE_BUF_SIZE; //for funtrace_gdb.py
 
     NOINSTR trace_global_state()
     {
@@ -689,7 +689,7 @@ extern "C" void NOFUNTRACE *__cxa_begin_catch(void *thrown_exception) throw() {
             return nullptr;
         }
     }
-    g_thread_trace.trace(caller, 1ULL<<FUNTRACE_CATCH_BIT);
+    g_thread_trace.trace(caller, FUNTRACE_CATCH_MASK);
 
     return real_cxa_begin_catch(thrown_exception);
 }
