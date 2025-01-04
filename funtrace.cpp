@@ -755,6 +755,9 @@ void NOINSTR sigtrap_handler::thread_func()
 
 struct ftrace_event
 {
+    NOINSTR ftrace_event() {}
+    NOINSTR ~ftrace_event() {}
+
     uint64_t timestamp;
     std::string line;
 };
