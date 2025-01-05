@@ -1,2 +1,4 @@
 Cargo.lock
 target/
+built-tests/*
+out/*

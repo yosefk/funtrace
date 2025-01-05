@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import json
 import os
+import glob
 from multiprocessing import Pool
 
 call='+'
@@ -12,6 +13,7 @@ def parse_perfetto_json(fname):
     events = data['traceEvents']
     threads = {}
     thread_names = {}
+    timestamps = set()
     for event in events:
         phase = event['ph']
         tid = event['tid']
@@ -22,6 +24,10 @@ def parse_perfetto_json(fname):
             continue
         timepoints = threads.setdefault(thread_names[tid], list())
         timestamp = event['ts']
+
+        assert timestamp not in timestamps, 'expecting unique timestamps in every thread!'
+        timestamps.add(timestamp)
+
         if phase == 'B': # begin timepoint
             timepoints.append((call, name, timestamp))
         elif phase == 'X': # complete event
@@ -29,50 +35,85 @@ def parse_perfetto_json(fname):
             timepoints.append((call, name, timestamp))
             timepoints.append((ret, name, timestamp+duration))
 
+    # sort by the timestamp
     for timepoints in threads.values():
-        timepoints.sort(key=lambda t: t[2])
+        timepoints.sort(key=lambda t: (t[2]))
 
     data['threads'] = threads
 
     return data
 
-def print_thread(flow):
+def print_thread(flow,line=-1):
     level = 0
-    for point in timepoints:
+    for i,point in enumerate(flow):
         what = point[0]
         name = point[1]
         if what == ret:
             level -= 1
-        print('  '*level,what,name)
+        start = '  '*level
+        if line>=0:
+            if i<line:
+                start='|'+start
+            elif i==line:
+                start='V'+start
+            else:
+                start=' '+start
+        print(start,what,name)
         if what == call:
             level += 1
 
 def verify_thread(timepoints, ref_calls_and_returns):
     ok = True
     n = len(timepoints)
+    errline = -1
     if len(timepoints) != len(ref_calls_and_returns):
         print(f'mismatch in the number of events (expected {len(ref_calls_and_returns)}, found {n})')
         ok = False
         n = min(n, len(ref_calls_and_returns))
-    for ((what_ref,func),(what,name,_)) in zip(ref_calls_and_returns[:n], timepoints[:n]):
+    for i,((what_ref,func),(what,name,_)) in enumerate(zip(ref_calls_and_returns[:n], timepoints[:n])):
         if what != what_ref or (func+'(' not in name and func+' ' not in name):
-            print('expected',what_ref,func,'- found -',what,name)
+            print('expected',what_ref,func,', found',what,name)
             ok = False
+            errline = i
             break
     if not ok:
         print('expected:')
-        print_thread(ref_calls_and_returns)
+        print_thread(ref_calls_and_returns,errline)
         print('found:')
-        print_thread(timepoints)
+        print_thread(timepoints,errline)
     return ok
 
-longjmp_ref = [(call, 'main')] + [
+exceptions_ref = [
+    (call,'catcher'),
+    (call,'before_try'),
+    (ret,'before_try'),
+    (call,'wrapper_call_outer'),
+    (call,'wrapper_tailcall_2'),
+    (call,'wrapper_tailcall_1'),
+    (call,'wrapper_call'),
+    (call,'thrower'),
+    (call,'__cxa_throw'),
+    (ret,'__cxa_throw'),
+    (ret,'thrower'), # throw going to the catch block should be decoded as all the
+    # unwound functions returning
+    (ret,'wrapper_call'),
+    (ret,'wrapper_tailcall_1'),
+    (ret,'wrapper_tailcall_2'),
+    (ret,'wrapper_call_outer'),
+    (call,'__cxa_begin_catch'),
+    (ret,'__cxa_begin_catch'),
+    (call,'after_catch'),
+    (ret,'after_catch'),
+    (call,'__cxa_end_catch'),
+    (ret,'__cxa_end_catch'),
+    (ret,'catcher'),
+]*3
+
+longjmp_ref = [
     (call,'setter'),
     (call,'before_setjmp'),
     (ret,'before_setjmp'),
     (call,'wrapper_call_outer'),
-    (call,'wrapper_tailcall_2'),
-    (call,'wrapper_tailcall_1'),
     (call,'wrapper_call'),
     (call,'jumper'),
     (call,'after_longjmp'), # this is not the call sequence in the code - after_longjmp is called
@@ -82,19 +123,10 @@ longjmp_ref = [(call, 'main')] + [
     (ret,'after_longjmp'),
     (ret,'jumper'),
     (ret,'wrapper_call'),
-    (ret,'wrapper_tailcall_1'),
-    (ret,'wrapper_tailcall_2'),
     (ret,'wrapper_call_outer'),
     (ret,'setter'),
 ]*3
 
-#data = parse_perfetto_json('out.json')
-#for thread,timepoints in sorted(data['threads'].items()):
-#    print('thread',thread)
-#    print_thread(timepoints)
-#
-#assert verify_thread(timepoints, longjmp_ref)
-#
 def system(cmd):
     print('running',cmd)
     status = os.system(cmd)
@@ -122,8 +154,8 @@ def build_cxx_test(main, shared=[]):
         test = main.split('.')[0]
         binary = f'{BUILDDIR}/{test}.{mode}'
         cmds = [
-            f'{CXX} -c {main} -o {BUILDDIR}/{test}.{mode}.o',
-            f'{CXX} -o {binary} {BUILDDIR}/{test}.{mode}.o'
+            f'{CXX} -c tests/{main} -o {BUILDDIR}/{test}.{mode}.o {CXXFLAGS} -I.',
+            f'{CXX} -o {binary} {BUILDDIR}/{test}.{mode}.o {CXXFLAGS}'
         ]
         cmdlists.append(cmds)
         binaries.setdefault(test,list()).append(binary)
@@ -139,7 +171,7 @@ def run_cxx_test(test, binaries):
         cmds = [
             f'mkdir -p {OUTDIR}/{name}',
             f'cd {OUTDIR}/{name}; {env} ../../{binary}',
-            f'cargo run -r --bin funtrace2viz {OUTDIR}/{name}/funtrace.raw {OUTDIR}/{name}/decoded > {OUTDIR}/{name}/f2v.out'
+            f'cargo run -r --bin funtrace2viz {OUTDIR}/{name}/funtrace.raw {OUTDIR}/{name}/funtrace > {OUTDIR}/{name}/f2v.out'
         ]
         cmdlists.append(cmds)
     return cmdlists
@@ -162,12 +194,25 @@ def main():
 
     buildcmds('exceptions.cpp')
     buildcmds('longjmp.cpp')
+    buildcmds('tailcall.cpp')
     pool.map(run_cmds, cmdlists)
 
     cmdlists = []
     for test,binaries in test2bins.items():
         cmdlists.extend(run_cxx_test(test,binaries))
     pool.map(run_cmds, cmdlists)
+
+    print('checking results...')
+
+    def load_thread(json):
+        return list(parse_perfetto_json(json)['threads'].values())[0]
+
+    for json in sorted(glob.glob('./out/exceptions.*/funtrace.json')):
+        print('checking',json)
+        assert verify_thread(load_thread(json), exceptions_ref)
+    for json in sorted(glob.glob('./out/longjmp.*/funtrace.json')):
+        print('checking',json)
+        assert verify_thread(load_thread(json), longjmp_ref)
 
 if __name__ == '__main__':
     main()

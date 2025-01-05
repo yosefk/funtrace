@@ -12,9 +12,8 @@ use num::{Rational64, FromPrimitive, Zero};
 
 const RETURN_BIT: i32 = 63;
 const RETURN_WITH_CALLER_ADDRESS_BIT: i32 = 62;
-const TAILCALL_BIT: i32 = 61;
 const CATCH_MASK: u64 = (1<<RETURN_BIT)|(1<<RETURN_WITH_CALLER_ADDRESS_BIT);
-const ADDRESS_MASK: u64 = !((1<<RETURN_BIT)|(1<<RETURN_WITH_CALLER_ADDRESS_BIT)|(1<<TAILCALL_BIT));
+const ADDRESS_MASK: u64 = !CATCH_MASK;
 const MAGIC_LEN: usize = 8;
 const LENGTH_LEN: usize = 8;
 
@@ -68,6 +67,7 @@ struct TraceConverter {
     cmd_line: String,
     first_event_in_json: bool,
     first_event_in_thread: bool,
+    num_events: i64,
 }
 
 #[repr(C)]
@@ -161,7 +161,7 @@ impl TraceConverter {
         TraceConverter { procaddr2sym: ProcAddr2Sym::new(), source_cache: HashMap::new(), sym_cache: HashMap::new(),
             max_event_age: args.max_event_age, oldest_event_time: args.oldest_event_time, dry: args.dry,
             samples: args.samples.clone(), threads: args.threads.clone(), cpu_freq: 0, cmd_line: "".to_string(),
-            first_event_in_json: false, first_event_in_thread: false
+            first_event_in_json: false, first_event_in_thread: false, num_events: 0
         }
     }
 
@@ -188,7 +188,8 @@ impl TraceConverter {
         }
     }
 
-    fn write_function_call_event(&mut self, json: &mut File, call_sym: &SymInfo, call_cycle: u64, return_cycle: u64, thread_id: &ThreadID, funcset: &mut HashSet<SymInfo>) -> io::Result<()> {
+    fn write_function_call_event(&mut self, json: &mut File, call_sym: &SymInfo, call_cycle: u64, return_cycle: u64, extra_ret_ns: u64, thread_id: &ThreadID, funcset: &mut HashSet<SymInfo>) -> io::Result<()> {
+        self.num_events += 1;
         if self.dry {
             return Ok(());
         }
@@ -210,13 +211,14 @@ impl TraceConverter {
         //we use rational numbers instead
         let rat = |n: u64| Rational64::from_u64(n).unwrap();
         let cycles_per_us = rat(self.cpu_freq) / rat(1000000);
+        let extra = rat(extra_ret_ns) / rat(1000);
 
         let digits = 4; //Perfetto timeline has nanosecond precision - no point in printing
         //more digits than 4 for the microsecond timestamps it expects in the JSON
 
         if return_cycle != 0 { // a "complete" event (ph:X)
             json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X","pid":{}}}"#, "\n,",
-                        thread_id.tid, rat2dec(&(rat(call_cycle)/cycles_per_us.clone()), digits), rat2dec(&(rat(return_cycle-call_cycle)/cycles_per_us), digits), json_name(call_sym), thread_id.pid).as_bytes())?; 
+                        thread_id.tid, rat2dec(&(rat(call_cycle)/cycles_per_us.clone()), digits), rat2dec(&(rat(return_cycle-call_cycle)/cycles_per_us + extra), digits), json_name(call_sym), thread_id.pid).as_bytes())?; 
         } else { // a "duration" event, in this case ph:B
             json.write(format!(r#"{}{{"tid":{},"ts":{},"name":{},"ph":"B","pid":{}}}"#, "\n,",
                         thread_id.tid, rat2dec(&(rat(call_cycle)/cycles_per_us.clone()), digits), json_name(call_sym), thread_id.pid).as_bytes())?; 
@@ -282,7 +284,7 @@ impl TraceConverter {
                 continue;
             }
             let mut stack: Vec<FunTraceEntry> = Vec::new();
-            let mut num_events = 0;
+            self.num_events = 0;
             let earliest_cycle = max(entries[0].cycle, oldest);
             let latest_cycle = entries[entries.len()-1].cycle;
             let mut num_orphan_returns = 0;
@@ -295,7 +297,6 @@ impl TraceConverter {
                 let catch = (entry.address & CATCH_MASK) == CATCH_MASK;
                 let ret_with_caller_addr = bit_set(entry.address, RETURN_WITH_CALLER_ADDRESS_BIT) && !catch;
                 let ret = (bit_set(entry.address, RETURN_BIT) || ret_with_caller_addr) && !catch;
-                let tailcall = bit_set(entry.address, TAILCALL_BIT);
                 let addr = entry.address & ADDRESS_MASK;
 
                 if !self.sym_cache.contains_key(&addr) {
@@ -330,13 +331,15 @@ impl TraceConverter {
                             //procaddr2sym strips the [clone...] from the name so we can compare by it
                             break;
                         }
-                        self.write_function_call_event(&mut json, &call_sym.clone(), last.cycle, entry.cycle + cycles_per_ns*unwound, &thread_trace.thread_id, &mut funcset)?;
+                        //these all end at the same cycle contrary to the JSON spec's perfect nesting requirement;
+                        //unlike XRay we try to make them stand apart by 1 ns (the timeline's precision), also makes testing more straightforward
+                        self.write_function_call_event(&mut json, &call_sym.clone(), last.cycle, entry.cycle, unwound, &thread_trace.thread_id, &mut funcset)?;
                         stack.pop();
                         unwound += 1;
                     }
                     continue;
                 }
-                if !ret && !tailcall {
+                if !ret {
                     stack.push(*entry);
                 }
                 else {
@@ -356,24 +359,8 @@ impl TraceConverter {
                     }
                     else {
                         let call_entry = stack.pop().unwrap();
-                        if bit_set(call_entry.address, TAILCALL_BIT) {
-                            println!("WARNING: a non-orphan tailcall popped from the stack, expected a call?..");
-                        }
                         (call_entry.cycle, call_entry.address & ADDRESS_MASK)
                     };
-                    if tailcall {
-                        //a tailcall from f to g means we won't ever see a return event from f - instead,
-                        //f jumps to g, and g returns straight to f's caller. when g returns to f's caller
-                        //(or when h tail-called by g returns to f's caller), we'll emit an event
-                        //returning from f, too. for this, we push an entry to the stack with TAILCALL_BIT set -
-                        //basically the same entry we just popped (f's), but with the bit set - essentially
-                        //we're "postponing its return for later."
-
-                        //either call addr is this entry's address (an orphan tail call) or we
-                        //popped it from the stack in which case it should have been a call, not a tailcall
-                        stack.push(FunTraceEntry{cycle: call_cycle, address: call_addr | (1<<TAILCALL_BIT)});
-                        continue;
-                    }
                     let mut call_sym = self.sym_cache.get(&call_addr).unwrap().clone();
                     //warn if we return to a different function from the one predicted by the call stack.
                     //this "shouldn't happen" but it does unless we ignore "virtual override thunks"
@@ -391,66 +378,51 @@ impl TraceConverter {
                             println!("      WARNING: call/return mismatch - {} popped from the stack but {} returning", json_name(&call_sym), json_name(&ret_sym));
                             let mut found = false;
                             while !found {
-                                self.write_function_call_event(&mut json, &call_sym.clone(), call_cycle, entry.cycle + cycles_per_ns*returns, &thread_trace.thread_id, &mut funcset)?;
-                                returns += 1;
+                                self.write_function_call_event(&mut json, &call_sym.clone(), call_cycle, entry.cycle, returns, &thread_trace.thread_id, &mut funcset)?;
                                 if stack.is_empty() {
                                     break;
                                 }
                                 let last = stack.last().unwrap();
-                                let addr = last.address & ADDRESS_MASK;
-                                call_sym = self.sym_cache.get(&addr).unwrap().clone();
+                                call_sym = self.sym_cache.get(&last.address).unwrap().clone();
                                 call_cycle = last.cycle;
                                 println!("        WARNING: popping {}", json_name(&call_sym));
                                 stack.pop();
+                                returns += 1;
                                 found = ret_sym.demangled_func == call_sym.demangled_func;
                             }
                         }
                     }
                     else if !stack.is_empty() {
-                        let mut i: i64 = stack.len() as i64 - 1;
-                        while i >= 0 {
-                            let stack_entry = stack[i as usize];
-                            if bit_set(stack_entry.address, TAILCALL_BIT) {
-                                i -= 1;
-                                continue; //we won't see tail callers' addresses in return-with-caller-address events
+                        let ret_caller_sym = self.sym_cache.get(&stack.last().unwrap().address).unwrap();
+                        if ret_sym.demangled_func != ret_caller_sym.demangled_func {
+                            println!("      WARNING: call/return mismatch - {} called from {}, the returning function's caller is {}", json_name(&call_sym), json_name(ret_caller_sym), json_name(&ret_sym));
+                            let mut found = false;
+                            while !found {
+                                self.write_function_call_event(&mut json, &call_sym.clone(), call_cycle, entry.cycle, returns, &thread_trace.thread_id, &mut funcset)?;
+                                if stack.is_empty() {
+                                    break;
+                                }
+                                let last = stack.last().unwrap();
+                                call_sym = self.sym_cache.get(&last.address).unwrap().clone();
+                                call_cycle = last.cycle;
+                                println!("        WARNING: popping {}", json_name(&call_sym));
+                                stack.pop();
+                                returns += 1;
+                                found = !stack.is_empty() && ret_sym.demangled_func == self.sym_cache.get(&stack.last().unwrap().address).unwrap().demangled_func;
                             }
-                            let addr = stack_entry.address & ADDRESS_MASK;
-                            let ret_caller_sym = self.sym_cache.get(&addr).unwrap();
-                            if ret_sym.demangled_func != ret_caller_sym.demangled_func {
-                                println!("      WARNING: call/return mismatch - {} called from {}, the returning function's caller is {}", json_name(&call_sym), json_name(ret_caller_sym), json_name(&ret_sym));
-                            }
-                            break;
                         }
                     }
-                    //this is a return - keep popping from the stack until we find a call,
-                    //handle popped tail calls as returns from the called function
-                    num_events += 1;
-                    self.write_function_call_event(&mut json, &call_sym, call_cycle, entry.cycle + cycles_per_ns*returns, &thread_trace.thread_id, &mut funcset)?;
-                    while !stack.is_empty() && bit_set(stack.last().unwrap().address, TAILCALL_BIT) {
-                        let last = stack.pop().unwrap();
-                        let tailcall_addr = last.address & ADDRESS_MASK;
-                        let call_sym = self.sym_cache.get(&tailcall_addr).unwrap();
-                        num_events += 1;
-                        //we (or rather the Perfetto JSON spec) want perfect nesting, so we make sure there's an ns latency between the timestmaps
-                        //of returns from tailcalls (though eg XRay doesn't bother and have them return at the same cycle.) hope we won't
-                        //have too many returns from tailcalls for a return timestamp to exceed a next actual event timestamp...
-                        self.write_function_call_event(&mut json, &call_sym.clone(), last.cycle, entry.cycle + cycles_per_ns*returns, &thread_trace.thread_id, &mut funcset)?;
-                        returns += 1;
-                    }
-
+                    self.write_function_call_event(&mut json, &call_sym, call_cycle, entry.cycle, returns, &thread_trace.thread_id, &mut funcset)?;
                 }
             }
             //if the stack isn't empty, record "begin" events - Perfetto displays "unfinished calls" distinctively
-            //it doesn't matter if it was a call or a tail call in this context
             for entry in &stack {
-                 let addr = entry.address & ADDRESS_MASK;
-                 let call_sym = self.sym_cache.get(&addr).unwrap();
-                 self.write_function_call_event(&mut json, &call_sym.clone(), entry.cycle, 0, &thread_trace.thread_id, &mut funcset)?;
-                 num_events += 1;
+                 let call_sym = self.sym_cache.get(&entry.address).unwrap();
+                 self.write_function_call_event(&mut json, &call_sym.clone(), entry.cycle, 0, 0, &thread_trace.thread_id, &mut funcset)?;
             }
             let name = String::from_utf8(thread_trace.thread_id.name.iter().filter(|&&x| x != 0 as u8).copied().collect()).unwrap();
             if latest_cycle >= earliest_cycle {
-                println!("  thread {} {} - {} recent function calls logged over {} cycles [{} - {}]", thread_trace.thread_id.tid, name, num_events, latest_cycle-earliest_cycle, earliest_cycle, latest_cycle);
+                println!("  thread {} {} - {} recent function calls logged over {} cycles [{} - {}]", thread_trace.thread_id.tid, name, self.num_events, latest_cycle-earliest_cycle, earliest_cycle, latest_cycle);
             }
             else {
                 println!("    skipping thread {} {} (all {} logged function entry/return events are too old)", thread_trace.thread_id.tid, name, entries.len());

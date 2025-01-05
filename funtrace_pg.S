@@ -42,6 +42,22 @@ exe_xray_FunctionEntry:
         popq   %rdx
         ret
 
+// XRay instrumentation (unlike __fentry__/__return__ -pg instrumentation) calls separate
+// functions upon returning from a function and upon tail-calling a function instead of
+// returning from its caller. you would think this lets us present the tail call correctly (instead
+// of, given f which calls g which tail-calls h, misprepresent h as being called from f,
+// which we end up doing under -pg instrumentation because __return__ is called by g
+// before jumping to h)
+//
+// however, in practice, it's not clear how to make use of the tail-call vs return distinction.
+// for example, you push the tail-caller to the stack and pop it when its callee returns; this
+// works well if this tail-callee is instrumented or calls at least one instrumented function
+// itself, but what if it doesn't - when is the tail-caller going to be "diagnosed" as having
+// returned in that case?
+//
+// XRay itself records distinct event types, EXIT and TAIL_EXIT, and then xray-converter.cpp
+// treats them exactly the same in exportAsChromeTraceEventFormat(). we simply record a single
+// event type for both events
         .cfi_endproc
         .size   __fentry__, .-__fentry__
         .size   __xray_FunctionEntry, .-__xray_FunctionEntry
@@ -55,9 +71,15 @@ exe_xray_FunctionEntry:
         .type   __xray_FunctionExit, @function
         .globl  exe_xray_FunctionExit
         .type   exe_xray_FunctionExit, @function
+        .globl  __xray_FunctionTailExit
+        .type   __xray_FunctionTailExit, @function
+        .globl  exe_xray_FunctionTailExit
+        .type   exe_xray_FunctionTailExit, @function
 __return__:
 __xray_FunctionExit:
 exe_xray_FunctionExit:
+__xray_FunctionTailExit:
+exe_xray_FunctionTailExit:
         .cfi_startproc
 
         movq    (%rsp), %r10
@@ -102,50 +124,5 @@ exe_xray_FunctionExit:
         .size   __return__, .-__return__
         .size   __xray_FunctionExit, .-__xray_FunctionExit
         .size   exe_xray_FunctionExit, .-exe_xray_FunctionExit
-
-// XRay instrumentation (unlike __fentry__/__return__ -pg instrumentation) calls separate
-// functions upon returning from a function and upon tail-calling a function instead of
-// returning from its caller. this lets us present the tail call correctly (instead
-// of, given f which calls g which tail-calls h, misprepresent h as being called from f,
-// which we end up doing under -pg instrumentation because __return__ is called by g
-// before jumping to h)
-
-        .p2align 4
-        .globl  __xray_FunctionTailExit
-        .type   __xray_FunctionTailExit, @function
-        .globl  exe_xray_FunctionTailExit
-        .type   exe_xray_FunctionTailExit, @function
-__xray_FunctionTailExit:
-exe_xray_FunctionTailExit:
-        .cfi_startproc
-
-        movq    (%rsp), %r10
-
-        pushq   %rdx
-        pushq   %rax
-        
-        movq    %fs:g_thread_trace@tpoff, %r11
-        rdtsc
-        salq    $32, %rdx
-        orq     %rdx, %rax
-        cmpb    $0, %fs:8+g_thread_trace@tpoff
-        je      .early_exit_from_tailexit
-        // the only difference between __return__ aka __xray_FunctionExit
-        // and __xray_FunctionTailExit is that we set a different bit to
-        // mark this as a tail call, for trace parsing to distinguish between
-        // returns and tail calls
-        btsq    $FUNTRACE_TAILCALL_BIT, %r10
-        movq    %rax, 8(%r11)
-        addq    $16, %r11
-        movq    %r10, -16(%r11)
-        btr         $FUNTRACE_LOG_BUF_SIZE, %r11
-        movq    %r11, %fs:g_thread_trace@tpoff
-
-.early_exit_from_tailexit:
-        popq   %rax
-        popq   %rdx
-        ret
-
-        .cfi_endproc
         .size   __xray_FunctionTailExit, .-__xray_FunctionTailExit
         .size   exe_xray_FunctionTailExit, .-exe_xray_FunctionTailExit
