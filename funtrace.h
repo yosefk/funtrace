@@ -29,48 +29,43 @@ extern "C" {
 #endif
 
 /* to "just append the current trace snapshot to funtrace.raw", all you need
-   is this function
-
-   this method writes the current procmaps together with
-   the trace data (which, strictly speaking, is potentially incorrect because
-   you could have code pointers in the trace data pointing to already unloaded code;
-   the more complex methods below can handle this somewhat better.)
+   is this function (this is also what SIGTRAP does unless you compile with
+   -DFUNTRACE_NO_SIGTRAP)
 
    threads cannot be created, and their termination is delayed until the data
    is fully written out
+
+   note that if a shared object was unloaded during the time range in the snapshot
+   (thankfully not a very common scenario), function calls traced from this shared
+   object will not be possible to decode to symbolic function names (this is true
+   for all the functions taking snapshots below)
  */
 void funtrace_pause_and_write_current_snapshot();
 
-/* these methods are for saving procmaps and trace data snapshots, and then
-   writing them out at the time of your choosing (it's up to you to tell
-   which procmaps were relevant for which trace data sample; though unless
-   you do dynamic code loading and unloading, getting the procmaps once
-   when all the libraries were loaded is enough for all your trace samples) */
+/* these methods are for saving trace data snapshots, and then
+   writing them out at the time of your choosing. */
 
-struct funtrace_procmaps;
 struct funtrace_snapshot;
 
-/* you want to call this every time code might get loaded to new addresses;
-   you can then save the procmaps corresponding to each snapshot using
-   funtrace_write_saved_snapshot() */
-struct funtrace_procmaps* funtrace_get_procmaps();
 /* a snapshot has the size FUNTRACE_BUF_SIZE times the number of threads alive
    at the time when it's taken. threads can't be created and can't terminate
    until the trace data is copied into the snapshot */
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot();
+
 /* you might also want to only get the data up to a certain age,
    both to save time & space and to get "the part you want" (like from the
    start of handling some event till the end) */
 uint64_t funtrace_time(); /* timestamp from the same source used for tracing */
 uint64_t funtrace_ticks_per_second(); /* funtrace_time()/funtrace_ticks_per_second() converts time to seconds */
+
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time);
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot_up_to_age(uint64_t max_event_age);
-void funtrace_free_procmaps(struct funtrace_procmaps* procmaps);
 void funtrace_free_snapshot(struct funtrace_snapshot* snapshot);
 
 /* writing out a sample into its own file after it was obtained with funtrace_pause_and_get_snapshot()
-   does not interfere with threads starting and terminating */
-void funtrace_write_saved_snapshot(const char* filename, struct funtrace_procmaps* procmaps, struct funtrace_snapshot* snapshot);
+   does not interfere with threads starting and terminating. TODO: we could add a version with
+   a "write_data" callback instead of a filename given demand */
+void funtrace_write_snapshot(const char* filename, struct funtrace_snapshot* snapshot);
 
 /* this is useful to save memory for the event buffer in threads you don't want to trace,
    and also to save some but not all of the function call overhead due to being compiled
@@ -85,9 +80,11 @@ void funtrace_disable_tracing();
 void funtrace_enable_tracing();
 
 #ifdef __clang__
-#define NOFUNTRACE __attribute__((xray_never_instrument))
+#define NOFUNTRACE __attribute__((xray_never_instrument)) __attribute__((no_instrument_function))
+#define DOFUNTRACE __attribute__((xray_always_instrument))
 #else
 #define NOFUNTRACE __attribute__((no_instrument_function))
+#define DOFUNTRACE /* gcc doesn't have an attribute to force instrumentation */
 #endif
 
 #ifdef __cplusplus

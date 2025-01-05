@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include "funtrace.h"
+#include <link.h>
 #include "funtrace_buf_size.h"
 
 //we could ask the user to compile this file without -finstrument-functions/-pg
@@ -187,14 +188,19 @@ struct trace_global_state
     std::string cmdline;
     uint64_t cpu_freq;
     int buf_size = FUNTRACE_BUF_SIZE; //for funtrace_gdb.py
+    char* exe_path = nullptr;
 
     NOINSTR trace_global_state()
     {
         pid = getpid();
         cmdline = get_cmdline();
         cpu_freq = cpu_cycles_per_second();
+        exe_path = realpath("/proc/self/exe", nullptr);
     }
-    NOINSTR ~trace_global_state() {}
+    NOINSTR ~trace_global_state()
+    {
+        ::free(exe_path);
+    }
 
     std::ostream& NOINSTR file()
     {
@@ -322,13 +328,6 @@ static uint64_t NOINSTR cpu_cycles_per_second()
 
 extern "C" uint64_t NOINSTR funtrace_ticks_per_second() { return g_trace_state.cpu_freq; }
 
-struct funtrace_procmaps
-{
-    std::vector<char> data;
-    NOINSTR funtrace_procmaps() {}
-    NOINSTR ~funtrace_procmaps() {}
-};
-
 const int MAGIC_LEN = 8;
 
 static void NOINSTR write_chunk(std::ostream& file, const char* magic, const void* data, uint64_t bytes)
@@ -339,9 +338,11 @@ static void NOINSTR write_chunk(std::ostream& file, const char* magic, const voi
     file.write((char*)data, bytes);
 }
 
-static void NOINSTR write_procmaps(std::ostream& file, funtrace_procmaps* procmaps)
+static void NOINSTR write_procmaps(std::ostream& file, std::stringstream& procmaps)
 {
-    write_chunk(file, "PROCMAPS", &procmaps->data[0], procmaps->data.size());
+    std::string s = std::move(procmaps).str();
+    write_chunk(file, "PROCMAPS", &s[0], s.size());
+    procmaps.str(std::move(s));
 }
 
 struct event_buffer
@@ -389,6 +390,31 @@ static void NOINSTR write_ftrace(std::ostream& file, const std::vector<std::stri
     }
 }
 
+//finding the executable segments using dl_iterate_phdr() is faster than reading /proc/self/maps
+//and produces less segments since we ignore the non-executable ones
+static int phdr_callback (struct dl_phdr_info *info,
+                          size_t size, void *data) {
+    std::stringstream& s = *(std::stringstream*)data;
+    for(int i=0; i<info->dlpi_phnum; ++i ) {
+        const auto& phdr = info->dlpi_phdr[i];
+        //we only care about loadable executable segments (the likes of .text)
+        if(phdr.p_type == PT_LOAD && (phdr.p_flags & PF_X)) {
+            //we print in "roughly" the format of /proc/self/maps, with arbitrary values for the fields we don't really care about
+            uint64_t start_addr = info->dlpi_addr + phdr.p_vaddr;
+            uint64_t end_addr = start_addr + phdr.p_memsz;
+            const char* name = info->dlpi_name[0] ? info->dlpi_name : g_trace_state.exe_path;
+            s << start_addr << '-' << end_addr << " r-xp " << phdr.p_vaddr << " 0:0 0 " << name << '\n';
+        }
+    }
+    return 0;
+}
+
+static void NOINSTR get_procmaps(std::stringstream& procmaps)
+{
+    procmaps << std::hex;
+    dl_iterate_phdr(phdr_callback, &procmaps);
+}
+
 extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
 {
     std::lock_guard<std::mutex> guard(g_trace_state.mutex);
@@ -397,9 +423,9 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
         trace->pause_tracing();
     }
     std::ostream& file = g_trace_state.file();
-    funtrace_procmaps* procmaps = funtrace_get_procmaps();
+    std::stringstream procmaps;
+    get_procmaps(procmaps);
     write_procmaps(file, procmaps);
-    funtrace_free_procmaps(procmaps);
 
     //we don't allocate a snapshot - we save the memory for this by writing
     //straight from the trace buffers (at the expense of pausing tracing
@@ -426,27 +452,11 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     file.flush();
 }
 
-extern "C" funtrace_procmaps* NOINSTR funtrace_get_procmaps()
-{
-    std::ifstream maps_file("/proc/self/maps", std::ios::binary);
-    if (!maps_file.is_open()) {
-        std::cerr << "funtrace - failed to open /proc/self/maps, traces will be impossible to decode" << std::endl;
-        return nullptr;
-    }
-
-    funtrace_procmaps* p = new funtrace_procmaps;
-
-    p->data = std::vector<char>(
-        (std::istreambuf_iterator<char>(maps_file)),
-        std::istreambuf_iterator<char>());
-
-    return p;
-}
-
 struct funtrace_snapshot
 {
     std::vector<event_buffer> thread_traces;
     std::vector<std::string> ftrace_events;
+    std::stringstream procmaps;
     NOINSTR funtrace_snapshot() {}
     NOINSTR ~funtrace_snapshot() {}
 };
@@ -468,12 +478,8 @@ funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
         trace->resume_tracing();
     }
     ftrace_events_snapshot(snapshot->ftrace_events);
+    get_procmaps(snapshot->procmaps);
     return snapshot;
-}
-
-extern "C" void NOINSTR funtrace_free_procmaps(funtrace_procmaps* procmaps)
-{
-    delete procmaps;
 }
 
 extern "C" void NOINSTR funtrace_free_snapshot(funtrace_snapshot* snapshot)
@@ -484,10 +490,10 @@ extern "C" void NOINSTR funtrace_free_snapshot(funtrace_snapshot* snapshot)
     delete snapshot;
 }
 
-extern "C" void NOINSTR funtrace_write_saved_snapshot(const char* filename, funtrace_procmaps* procmaps, funtrace_snapshot* snapshot)
+extern "C" void NOINSTR funtrace_write_snapshot(const char* filename, funtrace_snapshot* snapshot)
 {
     std::ofstream file(filename);
-    write_procmaps(file, procmaps);
+    write_procmaps(file, snapshot->procmaps);
     write_funtrace(file);
     write_tracebufs(file, snapshot->thread_traces);
     write_ftrace(file, snapshot->ftrace_events);
@@ -568,6 +574,7 @@ extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_sta
         trace->resume_tracing();
     }
     ftrace_events_snapshot(snapshot->ftrace_events, time);
+    get_procmaps(snapshot->procmaps);
     return snapshot;
 }
 
@@ -678,8 +685,11 @@ g_funtrace_register_main_thread;
 //that f catches and calls h, we want this to be understood as g returning and f calling h,
 //rather than g calling h; which our interposing & tracing doesn't completely ensure but does make
 //work in many cases)
-extern "C" void NOFUNTRACE *__cxa_begin_catch(void *thrown_exception) throw() {
+extern "C" void* NOFUNTRACE __cxa_begin_catch(void *thrown_exception) throw() {
     void* caller = __builtin_return_address(0);
+
+    g_thread_trace.trace(caller, FUNTRACE_CATCH_MASK);
+    g_thread_trace.trace((void*)&__cxa_begin_catch, 0);
 
     static void *(*real_cxa_begin_catch)(void *) = nullptr;
     if (!real_cxa_begin_catch) {
@@ -689,9 +699,58 @@ extern "C" void NOFUNTRACE *__cxa_begin_catch(void *thrown_exception) throw() {
             return nullptr;
         }
     }
-    g_thread_trace.trace(caller, FUNTRACE_CATCH_MASK);
 
-    return real_cxa_begin_catch(thrown_exception);
+    void* ret = real_cxa_begin_catch(thrown_exception);
+
+    g_thread_trace.trace((void*)&__cxa_begin_catch, 1ULL<<FUNTRACE_RETURN_BIT);
+    return ret;
+}
+
+//we interpose __cxa_end_catch just in order to instrument it - so as to make it visible
+//in the trace that an exception was caught. we don't instrument it "normally" however
+//since in some cases funtrace.cpp might be compiled without instrumentation flags -
+//so we actually make sure it's __NOT__ instrumented but call trace() directly
+extern "C" void NOFUNTRACE __cxa_end_catch(void) throw() {
+    static void (*real_cxa_end_catch)(void) = nullptr;
+
+    g_thread_trace.trace((void*)&__cxa_end_catch, 0);
+
+    if (!real_cxa_end_catch) {
+        real_cxa_end_catch = (void (*)(void))dlsym(RTLD_NEXT, "__cxa_end_catch");
+        if (!real_cxa_end_catch) {
+            fprintf(stderr, "Error locating original __cxa_end_catch: %s\n", dlerror());
+            return;
+        }
+    }
+
+    real_cxa_end_catch();
+
+    g_thread_trace.trace((void*)&__cxa_end_catch, 1ULL<<FUNTRACE_RETURN_BIT);
+}
+
+extern "C" void NOFUNTRACE
+#ifdef __GNUC__
+__cxa_throw(void* thrown_object, void* type_info, void (*dest)(void *))
+#elif defined(__clang__)
+__cxa_throw(void* thrown_object, std::type_info* type_info, void (_GLIBCXX_CDTOR_CALLABI *dest)(void*))
+#endif
+{
+    static void (*real_cxa_throw)(void*, void*, void (*)(void*)) = nullptr;
+
+    g_thread_trace.trace((void*)&__cxa_throw, 0);
+
+    if(!real_cxa_throw) {
+        real_cxa_throw = (void (*)(void*, void*, void (*)(void*)))dlsym(RTLD_NEXT, "__cxa_throw");
+        if(!real_cxa_throw) {
+            fprintf(stderr, "Error locating original __cxa_throw: %s\n", dlerror());
+            return; 
+        }
+    } 
+
+    //__cxa_throw doesn't return so we record it as a "point event", without logging
+    //the actual time it takes
+    g_thread_trace.trace((void*)&__cxa_throw, 1ULL<<FUNTRACE_RETURN_BIT);
+    real_cxa_throw(thrown_object, type_info, dest);
 }
 
 //we register a signal handler for SIGTRAP, and have a thread waiting for the signal
