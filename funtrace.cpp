@@ -14,6 +14,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 #include "funtrace.h"
 #include <link.h>
 #include "funtrace_buf_size.h"
@@ -842,10 +844,14 @@ struct ftrace_handler
             //no point in spawning a thread to collect ftrace events
             return;
         }
+        mutex.lock();
         events.resize(FUNTRACE_FTRACE_EVENTS_IN_BUF);
         thread = std::thread([this] {
             thread_func();
         });
+        //wait for the thread to unlock the mutex to make sure it started
+        mutex.lock();
+        mutex.unlock();
     }
     NOINSTR ~ftrace_handler() {
         //we make sure the thread is awakened by a thread-spawning event,
@@ -976,7 +982,19 @@ void NOINSTR ftrace_handler::thread_func()
     //enable tracing
     write_file("tracing_on", "1");
 
+    //attempt to set a high priority; SCHED_FIFO requires permissions
+    //and is likely to fail, fall back on nice -20
+    struct sched_param param;
+    param.sched_priority = 99;
+    if(pthread_setschedparam(pthread_self(), SCHED_FIFO, &param)) {
+        setpriority(PRIO_PROCESS, tid, -20);
+    }
+
     std::ifstream trace_pipe(base+"trace_pipe");
+
+    //signals that we started
+    mutex.unlock();
+
     while(!quit) {
         std::string line;
         std::getline(trace_pipe, line);
