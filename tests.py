@@ -171,12 +171,17 @@ def run_cmds(cmds):
 def build_cxx_test(main, shared=[]):
     cmdlists = []
     binaries = {}
-    for mode in ['finstr','pg','xray']:
+    for mode in ['fi-gcc','fi-clang','pg','xray']:
         CXXFLAGS="-O3 -std=c++11 -Wall"
         if mode == 'xray':
             CXXFLAGS += " -fxray-instruction-threshold=1"
-        compiler = 'clang++' if mode=='xray' else 'g++'
-        CXX = f'./compiler-wrappers/funtrace-{mode}-{compiler}'
+        compiler = {
+           'fi-gcc':'finstr-g++',
+           'fi-clang':'finstr-clang++',
+           'pg':'pg-g++',
+           'xray':'xray-clang++',
+        }
+        CXX = f'./compiler-wrappers/funtrace-{compiler[mode]}'
         test = main.split('.')[0]
         binary = f'{BUILDDIR}/{test}.{mode}'
         cmds = [
@@ -197,7 +202,7 @@ def run_cxx_test(test, binaries):
         cmds = [
             f'mkdir -p {OUTDIR}/{name}',
             f'cd {OUTDIR}/{name}; {env} ../../{binary}',
-            f'cargo run -r --bin funtrace2viz {OUTDIR}/{name}/funtrace.raw {OUTDIR}/{name}/funtrace > {OUTDIR}/{name}/f2v.out'
+            f'./target/release/funtrace2viz {OUTDIR}/{name}/funtrace.raw {OUTDIR}/{name}/funtrace > {OUTDIR}/{name}/f2v.out'
         ]
         cmdlists.append(cmds)
     return cmdlists

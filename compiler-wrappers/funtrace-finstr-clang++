@@ -1,0 +1,22 @@
+#!/usr/bin/python3
+import sys
+import os
+import subprocess
+linking = '-c' not in sys.argv and '-S' not in sys.argv and '-E' not in sys.argv
+args = sys.argv[1:]
+
+# clang doesn't have -finstrument-functions-exclude-file-list so you can't exclude header files
+# easily; it does however have -finstrument-functions-after-inlining which is a good default
+# in general and especially in the absence of -finstrument-functions-exclude-file-list.
+# you can use -finstrument-functions instead if needed
+args += "-g -pthread -finstrument-functions-after-inlining".split()
+
+if linking:
+    is_shared = '-shared' in args
+    if not is_shared: # don't link the runtime into .so's - only into the executables using them
+        srcdir = os.path.dirname(os.path.dirname(__file__))
+        args += [os.path.join(srcdir, f) for f in ['funtrace.cpp']] + [f'-Wl,--dynamic-list={srcdir}/funtrace.dyn']
+    args += ['-ldl']
+
+clangpath = subprocess.getoutput('which clang++')
+os.execl(clangpath, *([clangpath] + args))
