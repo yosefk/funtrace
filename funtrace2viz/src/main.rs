@@ -125,10 +125,13 @@ fn parse_ftrace_lines(input: &String, transform_timestamp: impl Fn(u64) -> Strin
     results
 }
 
-fn rat2dec(rational: &Rational64, decimal_places: usize) -> String {
+fn rat2dec(rational: &Rational64, decimal_places: u32) -> String {
+    // Round; we're assuming positive numbers - add 0.0..05
+    let rounded = rational + Rational64::from_u64(5).unwrap() / Rational64::from_u64(10u64.pow(decimal_places+1)).unwrap();
+
     // Get numerator and denominator as BigInt
-    let numerator = rational.numer();
-    let denominator = rational.denom();
+    let numerator = rounded.numer();
+    let denominator = rounded.denom();
     
     // Perform division with extra precision to ensure accuracy
     let mut quotient = numerator / denominator;
@@ -188,7 +191,8 @@ impl TraceConverter {
         }
     }
 
-    fn write_function_call_event(&mut self, json: &mut File, call_sym: &SymInfo, call_cycle: u64, return_cycle: u64, extra_ret_ns: u64, thread_id: &ThreadID, funcset: &mut HashSet<SymInfo>) -> io::Result<()> {
+    //extra_ns shifts the return timestamp if positive or the call timestamp if negative
+    fn write_function_call_event(&mut self, json: &mut File, call_sym: &SymInfo, call_cycle: u64, return_cycle: u64, extra_ns: i32, thread_id: &ThreadID, funcset: &mut HashSet<SymInfo>) -> io::Result<()> {
         self.num_events += 1;
         if self.dry {
             return Ok(());
@@ -211,19 +215,30 @@ impl TraceConverter {
         //we use rational numbers instead
         let rat = |n: u64| Rational64::from_u64(n).unwrap();
         let cycles_per_us = rat(self.cpu_freq) / rat(1000000);
-        let extra = rat(extra_ret_ns) / rat(1000);
+
+        let (extra_ret, extra_call) = if extra_ns > 0 {
+            (rat(extra_ns as u64) / rat(1000), rat(0))
+        }
+        else {
+            (rat(0), rat(-extra_ns as u64) / rat(1000))
+        };
 
         let digits = 4; //Perfetto timeline has nanosecond precision - no point in printing
-        //more digits than 4 for the microsecond timestamps it expects in the JSON
+        //more digits than 3 for the microsecond timestamps it expects in the JSON; we print 4
+        //for testing to make sure that cycles don't round to the same ns that should be distinct events
 
-        if return_cycle != 0 { // a "complete" event (ph:X)
+        if return_cycle != 0 && call_cycle != 0 { // a "complete" event (ph:X); these needn't be sorted by timestamp
+            //note that we could have used the B and E events for "incomplete" function calls missing a call
+            //or a return timestamp. however, the last orphan B event seems to be missing from Perfetto's rendering
+            //and all of the orphan E events seem to be missing; B and E are apparently mostly designed to come in pairs
+            //(despite the beautiful gradient that orphan B events are rendered with)
             json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X","pid":{}}}"#, "\n,",
-                        thread_id.tid, rat2dec(&(rat(call_cycle)/cycles_per_us.clone()), digits), rat2dec(&(rat(return_cycle-call_cycle)/cycles_per_us + extra), digits), json_name(call_sym), thread_id.pid).as_bytes())?; 
-        } else { // a "duration" event, in this case ph:B
-            json.write(format!(r#"{}{{"tid":{},"ts":{},"name":{},"ph":"B","pid":{}}}"#, "\n,",
-                        thread_id.tid, rat2dec(&(rat(call_cycle)/cycles_per_us.clone()), digits), json_name(call_sym), thread_id.pid).as_bytes())?; 
-        }
-    
+                        thread_id.tid,
+                        rat2dec(&(rat(call_cycle)/cycles_per_us.clone() - extra_call), digits),
+                        rat2dec(&(rat(return_cycle-call_cycle)/cycles_per_us + extra_call + extra_ret), digits),
+                        json_name(call_sym), thread_id.pid).as_bytes())?; 
+        }    
+
         funcset.insert(call_sym.clone());
     
         //cache the source code if it's the first time we see this file
@@ -266,7 +281,7 @@ impl TraceConverter {
         let rat = |n: u64| Rational64::from_u64(n).unwrap();
         //ftrace timestamps are supposed to be in seconds; CPU frequency is in TSC cycles per second;
         //so dividing by frequency will convert TSC to seconds. Perfetto timeline accuracy is ns
-        //hence 10 digits after '.'
+        //hence 10 digits after '.' (9 plus another to make sure different cycles don't become the same ns)
         let cycles_per_second = rat(self.cpu_freq);
         let fixts = |ts: u64| format!("{}", rat2dec(&(rat(ts)/cycles_per_second), 10));
         let mut ftrace_events = parse_ftrace_lines(ftrace_text, fixts);
@@ -274,8 +289,6 @@ impl TraceConverter {
         let oldest = self.oldest_event(sample_entries, &ftrace_events);
 
         ftrace_events.retain(|event| event.timestamp >= oldest);
-    
-        let cycles_per_ns = (self.cpu_freq as f64 / 1000000000.0 + 1.) as u64;
     
         for thread_trace in sample_entries {
             let entries = &thread_trace.trace;
@@ -289,6 +302,8 @@ impl TraceConverter {
             let latest_cycle = entries[entries.len()-1].cycle;
             let mut num_orphan_returns = 0;
             self.first_event_in_thread = true;
+
+            let mut expecting_to_return_into_sym = self.procaddr2sym.unknown_symbol();
     
             for entry in entries {
                 if oldest > entry.cycle {
@@ -313,7 +328,7 @@ impl TraceConverter {
                 if ignore_addrs.contains(&addr) {
                     continue;
                 }
-                //println!("ret {} catch {} sym {}", ret, catch, json_name(self.sym_cache.get(&addr).unwrap()));
+                //println!("{} {} sym {}", stack.len(), if catch { "catch" } else if ret { "ret" } else { "call" }, json_name(self.sym_cache.get(&addr).unwrap()));
                 if catch {
                     //pop the entries on the stack until we find the function which logged the catch entry.
                     //if we don't find it, perhaps its call entry didn't make it into our trace, or, more
@@ -343,25 +358,27 @@ impl TraceConverter {
                     stack.push(*entry);
                 }
                 else {
-                    //write an event to json
-                    let (mut call_cycle, call_addr) = if stack.is_empty() {
+                    let ret_sym = self.sym_cache.get(&addr).unwrap().clone();
+
+                    if stack.is_empty() { //an "orphan return" - the call wasn't in the trace
                         num_orphan_returns += 1;
-                        // a return without a call - the call event must have been overwritten
-                        // in the cyclic trace buffer; fake a call at the start of the trace
-                        //
-                        // the "-num_orphan_returns" is here because vizviewer / Perfetto is
-                        // thrown off by multiple calls starting at the same cycle and puts
-                        // them in the wrong lane on the timeline (the JSON spec requires perfect
-                        // nesting of events). we multiply by cycles_per_ns
-                        // since Perfetto works at nanosecond accuracy and will treat timestamps
-                        // within the same ns as identical, the very thing we're trying to avoid
-                        (earliest_cycle - num_orphan_returns * cycles_per_ns, addr)
+                        //if ret_with_caller_addr, record the return into the function we're expecting to return into (might be unknown
+                        //or we could know by getting a previous return event with the caller's address)
+                        let sym = if ret_with_caller_addr { &expecting_to_return_into_sym } else { &ret_sym };
+                        self.write_function_call_event(&mut json, sym, earliest_cycle, entry.cycle, -num_orphan_returns, &thread_trace.thread_id, &mut funcset)?;
+                        if ret_with_caller_addr {
+                            expecting_to_return_into_sym = ret_sym.clone();
+                        }
+                        continue;
                     }
-                    else {
-                        let call_entry = stack.pop().unwrap();
-                        (call_entry.cycle, call_entry.address & ADDRESS_MASK)
-                    };
-                    let mut call_sym = self.sym_cache.get(&call_addr).unwrap().clone();
+                    if ret_with_caller_addr {
+                        //this might be useful if we get an orphan return next
+                        expecting_to_return_into_sym = ret_sym.clone();
+                    }
+
+                    let call_entry = stack.pop().unwrap();
+                    let mut call_cycle = call_entry.cycle;
+                    let mut call_sym = self.sym_cache.get(&(call_entry.address & ADDRESS_MASK)).unwrap().clone();
                     //warn if we return to a different function from the one predicted by the call stack.
                     //this "shouldn't happen" but it does unless we ignore "virtual override thunks"
                     //and it's good to at least emit a warning when it does since the trace will look strange
@@ -369,7 +386,6 @@ impl TraceConverter {
                     //warn if we're returning to a function different than predicted by the call stack,
                     //and try to recover from the problem by popping from the stack until we find right function
                     //(eg setjmp/longjmp can cause this problem).
-                    let ret_sym = self.sym_cache.get(&addr).unwrap().clone();
                     let mut returns = 0;
                     if !ret_with_caller_addr {
                         //comparing names instead of addresses because of the [clone ...] business - not sure if we can
@@ -415,10 +431,12 @@ impl TraceConverter {
                     self.write_function_call_event(&mut json, &call_sym, call_cycle, entry.cycle, returns, &thread_trace.thread_id, &mut funcset)?;
                 }
             }
-            //if the stack isn't empty, record "begin" events - Perfetto displays "unfinished calls" distinctively
+            //if the stack isn't empty, record a call with a fake return cycle
+            let mut fake_returns = stack.len() as i32;
             for entry in &stack {
                  let call_sym = self.sym_cache.get(&entry.address).unwrap();
-                 self.write_function_call_event(&mut json, &call_sym.clone(), entry.cycle, 0, 0, &thread_trace.thread_id, &mut funcset)?;
+                 self.write_function_call_event(&mut json, &call_sym.clone(), entry.cycle, latest_cycle, fake_returns, &thread_trace.thread_id, &mut funcset)?;
+                 fake_returns -= 1;
             }
             let name = String::from_utf8(thread_trace.thread_id.name.iter().filter(|&&x| x != 0 as u8).copied().collect()).unwrap();
             if latest_cycle >= earliest_cycle {

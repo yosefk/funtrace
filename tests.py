@@ -127,6 +127,32 @@ longjmp_ref = [
     (ret,'setter'),
 ]*3
 
+def orphans_ref(json):
+    # XRay instrumentation loses the address of the first orphan return
+    first_returning_function = '??' if 'xray' in json else 'orphan_return_3'
+    return [
+        # the first 3 call events are fake...
+        (call,'orphan_return_1'),
+        (call,'orphan_return_2'),
+        (call,first_returning_function),
+        (ret,first_returning_function),
+        (ret,'orphan_return_2'),
+        (call,'called_and_returned'),
+        (ret,'called_and_returned'),
+        (ret,'orphan_return_1'),
+        (call,'called_and_returned'),
+        (ret,'called_and_returned'),
+        (call,'orphan_call_1'),
+        (call,'called_and_returned'),
+        (ret,'called_and_returned'),
+        (call,'orphan_call_2'),
+        (call,'called_and_returned'),
+        (ret,'called_and_returned'),
+        # ...and so are the 2 return events
+        (ret,'orphan_call_2'),
+        (ret,'orphan_call_1'),
+    ]
+
 def system(cmd):
     print('running',cmd)
     status = os.system(cmd)
@@ -195,6 +221,7 @@ def main():
     buildcmds('exceptions.cpp')
     buildcmds('longjmp.cpp')
     buildcmds('tailcall.cpp')
+    buildcmds('orphans.cpp')
     pool.map(run_cmds, cmdlists)
 
     cmdlists = []
@@ -207,12 +234,17 @@ def main():
     def load_thread(json):
         return list(parse_perfetto_json(json)['threads'].values())[0]
 
-    for json in sorted(glob.glob('./out/exceptions.*/funtrace.json')):
+    def jsons(test): return sorted(glob.glob(f'./out/{test}.*/funtrace.json'))
+
+    for json in jsons('exceptions'):
         print('checking',json)
         assert verify_thread(load_thread(json), exceptions_ref)
-    for json in sorted(glob.glob('./out/longjmp.*/funtrace.json')):
+    for json in jsons('longjmp'): 
         print('checking',json)
         assert verify_thread(load_thread(json), longjmp_ref)
+    for json in jsons('orphans'): 
+        print('checking',json)
+        assert verify_thread(load_thread(json), orphans_ref(json))
 
 if __name__ == '__main__':
     main()

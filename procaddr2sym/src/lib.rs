@@ -237,9 +237,12 @@ impl ProcAddr2Sym {
         self.offset_cache = HashMap::new();
     }
 
-    pub fn proc_addr2sym(&mut self, proc_address: u64) -> SymInfo {
-        let unknown: SymInfo = SymInfo { func: "??".to_string(), demangled_func: "??".to_string(), file: "??".to_string(), line: 0, executable_file: "??".to_string(), static_addr: 0 };
+    pub fn unknown_symbol(&self) -> SymInfo {
+        return SymInfo { func: "??".to_string(), demangled_func: "??".to_string(), file: "??".to_string(), line: 0, executable_file: "??".to_string(), static_addr: 0 };
+    }
 
+    pub fn proc_addr2sym(&mut self, proc_address: u64) -> SymInfo {
+        let unknown = self.unknown_symbol();
         let map_opt = find_address_in_maps(proc_address, &self.maps);
         if map_opt == None { return unknown; }
         let map = map_opt.unwrap();
