@@ -35,31 +35,55 @@ struct CountsPage
 
 struct CountsPagesL1
 {
-    CountsPage* pages[PAGE_SIZE];
+    std::atomic<CountsPage*> pages[PAGE_SIZE];
     NOINSTR CountsPagesL1() { memset(pages, 0, sizeof(pages)); }
 };
 
+thread_local CountsPagesL1* g_freshPagesL1 = nullptr;
+thread_local CountsPage* g_freshPage = nullptr;
+
 struct CountsPagesL2
 {
-    CountsPagesL1* pagesL1[PAGE_SIZE];
+    std::atomic<CountsPagesL1*> pagesL1[PAGE_SIZE];
     NOINSTR CountsPagesL2() { memset(pagesL1, 0, sizeof(pagesL1)); }
 
+    //this is "honestly" thread safe; it might be faster if it only returned an atomic
+    //counter but allowed 2 threads to notice that a page wasn't allocated and
+    //allocate it concurrently, with one of the threads losing the counts which
+    //would be accumulated in its page which would be lost to the other thread
+    //writing the page pointer to pagesL1[] or pages[] arrays. but this thing
+    //probably needs to be trustworthy a bit more than it needs to be fast
+    //(you collect the counts mainly to decide which functions to not instrument
+    //with funtrace tracing; you don't do this often so slowness is not that bad
+    //in most cases whereas wondering about correctness is annoying. if slowness
+    //makes the flow unusable for you you can try replacing atomic<T*> with plain T*)
     std::atomic<count_t>& INLINE NOINSTR get_count(uint64_t address)
     {
+        //this and the next similar if test could be avoded by interposing pthread_create
+        //and initializing the TLS variables (or using ctors but that's even worse
+        //than the if statements in the generated code); probably not worth it
+        //given the much costlier stuff like the 3 atomic operations we have
+        if(!g_freshPagesL1) {
+            g_freshPagesL1 = new CountsPagesL1;
+        }
         auto high = high_bits(address);
-        CountsPagesL1* pages = pagesL1[high];
-        if(!pages) {
-            pages = new CountsPagesL1;
-            pagesL1[high] = pages;
+        auto& pages = pagesL1[high];
+        CountsPagesL1* nullPages = nullptr;
+        if(pages.compare_exchange_strong(nullPages, g_freshPagesL1)) {
+            g_freshPagesL1 = new CountsPagesL1;
+        }
+
+        if(!g_freshPage) {
+            g_freshPage = new CountsPage;
         }
         auto mid = mid_bits(address);
-        CountsPage* page = pages->pages[mid];
-        if(!page) {
-            page = new CountsPage;
-            pages->pages[mid] = page;
+        auto& page = pages.load()->pages[mid];
+        CountsPage* nullPage = nullptr;
+        if(page.compare_exchange_strong(nullPage, g_freshPage)) {
+            g_freshPage = new CountsPage;
         }
         auto low = low_bits(address);
-        return page->counts[low / sizeof(count_t)];
+        return page.load()->counts[low / sizeof(count_t)];
     }
 
     NOINSTR ~CountsPagesL2();
@@ -101,10 +125,10 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
     out << "COUNTS\n";
 
     for(uint64_t hi=0; hi<PAGE_SIZE; ++hi) {
-        auto pages = pagesL1[hi];
+        auto pages = pagesL1[hi].load();
         if(pages) {
             for(uint64_t mid=0; mid<PAGE_SIZE; ++mid) {
-                auto page = pages->pages[mid];
+                auto page = pages->pages[mid].load();
                 if(page) {
                     for(uint64_t lo=0; lo<PAGE_SIZE/sizeof(count_t); ++lo) {
                         auto& count = page->counts[lo];
