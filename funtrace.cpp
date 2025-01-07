@@ -1,3 +1,9 @@
+//an easy way to make the compiler wrappers add the funcount runtime
+//to the program instead of the funtrace runtime
+#ifdef FUNTRACE_FUNCOUNT
+#include "funcount.cpp"
+#else 
+
 #include <x86intrin.h>
 #include <cstdint>
 #include <iostream>
@@ -1068,4 +1074,6 @@ static void NOINSTR ftrace_events_snapshot(std::vector<std::string>& snapshot, u
 {
 }
 
-#endif
+#endif //FUNTRACE_NO_FTRACE
+
+#endif //FUNTRACE_FUNCOUNT

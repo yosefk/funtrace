@@ -69,7 +69,7 @@ static CountsPagesL2 g_page_tab;
 
 extern "C" void NOINSTR __cyg_profile_func_enter(void* func, void* caller)
 {
-    static_assert(sizeof(count_t) == sizeof(std::atomic<count_t>));
+    static_assert(sizeof(count_t) == sizeof(std::atomic<count_t>), "wrong size of atomic<count_t>");
     uint64_t addr = (uint64_t)func;
     std::atomic<count_t>& count = g_page_tab.get_count(addr);
     count += 1;

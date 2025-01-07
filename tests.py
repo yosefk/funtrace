@@ -153,6 +153,38 @@ def orphans_ref(json):
         (ret,'orphan_call_1'),
     ]
 
+class funinfo:
+    def __init__(self,line,t):
+        self.line = line
+        self.count = int(t[0])
+        self.module = t[3]
+        self.file, self.line = t[4].split(':')
+class symcount:
+    def __init__(self, lines):
+        self.lines = [(line,line.split()) for line in lines]
+    def info(self,func):
+        for line,t in self.lines:
+            if func in line:
+                return funinfo(line,t)
+
+def parse_symcount_txt(f):
+    return symcount(open(f).read().strip().split('\n'))
+
+def check_count_results(symcount_txt):
+    counts = parse_symcount_txt(symcount_txt)
+    for name,c in [('f',9000),('g',3000),('h',3000)]:
+        fname = name+'()'
+        info = counts.info(fname)
+        assert info.count == c, f'wrong count for {fname}: expected {c}, got {info.count}'
+        assert 'count.cpp' in info.file
+        assert '/count' in info.module
+
+        fname = name+'_shared()'
+        info = counts.info(fname)
+        assert info.count == c, f'wrong count for {fname}: expected {c}, got {info.count}'
+        assert 'count_shared.cpp' in info.file
+        assert '.so' in info.module
+
 def system(cmd):
     print('running',cmd)
     status = os.system(cmd)
@@ -168,11 +200,13 @@ def run_cmds(cmds):
     for cmd in cmds:
         system(cmd)
 
-def build_cxx_test(main, shared=[]):
+def build_cxx_test(main, shared=[], flags=''):
     cmdlists = []
     binaries = {}
     for mode in ['fi-gcc','fi-clang','pg','xray']:
-        CXXFLAGS="-O3 -std=c++11 -Wall"
+        if 'count' in main and 'fi' not in mode:
+            continue # FIXME!!
+        CXXFLAGS=f"-O3 -std=c++11 -Wall {flags}"
         if mode == 'xray':
             CXXFLAGS += " -fxray-instruction-threshold=1"
         compiler = {
@@ -184,9 +218,20 @@ def build_cxx_test(main, shared=[]):
         CXX = f'./compiler-wrappers/funtrace-{compiler[mode]}'
         test = main.split('.')[0]
         binary = f'{BUILDDIR}/{test}.{mode}'
-        cmds = [
+        cmds = []
+        LIBS = ''
+        if shared:
+            for cpp in shared:
+                module = cpp.split('.')[0]
+                lib = f'{os.path.realpath(BUILDDIR)}/{module}.{mode}.so'
+                cmds += [
+                    f'{CXX} -c tests/{cpp} -o {BUILDDIR}/{module}.mode.o {CXXFLAGS} -I. -fPIC',
+                    f'{CXX} -o {lib} {BUILDDIR}/{module}.mode.o {CXXFLAGS} -fPIC -shared',
+                ]
+                LIBS += ' '+lib
+        cmds += [
             f'{CXX} -c tests/{main} -o {BUILDDIR}/{test}.{mode}.o {CXXFLAGS} -I.',
-            f'{CXX} -o {binary} {BUILDDIR}/{test}.{mode}.o {CXXFLAGS}'
+            f'{CXX} -o {binary} {BUILDDIR}/{test}.{mode}.o {CXXFLAGS}{LIBS}',
         ]
         cmdlists.append(cmds)
         binaries.setdefault(test,list()).append(binary)
@@ -202,8 +247,15 @@ def run_cxx_test(test, binaries):
         cmds = [
             f'mkdir -p {OUTDIR}/{name}',
             f'cd {OUTDIR}/{name}; {env} ../../{binary}',
-            f'./target/release/funtrace2viz {OUTDIR}/{name}/funtrace.raw {OUTDIR}/{name}/funtrace > {OUTDIR}/{name}/f2v.out'
         ]
+        if 'count' in test:
+            cmds += [
+                f'./target/release/funcount2sym {OUTDIR}/{name}/funcount.txt | c++filt > {OUTDIR}/{name}/symcount.txt'
+            ]
+        else:
+            cmds += [
+                f'./target/release/funtrace2viz {OUTDIR}/{name}/funtrace.raw {OUTDIR}/{name}/funtrace > {OUTDIR}/{name}/f2v.out'
+            ]
         cmdlists.append(cmds)
     return cmdlists
 
@@ -218,8 +270,8 @@ def main():
 
     cmdlists = []
     test2bins = {}
-    def buildcmds(main,shared=[]):
-        c,b = build_cxx_test(main,shared)
+    def buildcmds(*args,**kw):
+        c,b = build_cxx_test(*args,**kw)
         cmdlists.extend(c)
         test2bins.update(b)
 
@@ -227,6 +279,7 @@ def main():
     buildcmds('longjmp.cpp')
     buildcmds('tailcall.cpp')
     buildcmds('orphans.cpp')
+    buildcmds('count.cpp',shared=['count_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT')
     pool.map(run_cmds, cmdlists)
 
     cmdlists = []
@@ -239,7 +292,7 @@ def main():
     def load_thread(json):
         return list(parse_perfetto_json(json)['threads'].values())[0]
 
-    def jsons(test): return sorted(glob.glob(f'./out/{test}.*/funtrace.json'))
+    def jsons(test): return sorted(glob.glob(f'./{OUTDIR}/{test}.*/funtrace.json'))
 
     for json in jsons('exceptions'):
         print('checking',json)
@@ -250,6 +303,10 @@ def main():
     for json in jsons('orphans'): 
         print('checking',json)
         assert verify_thread(load_thread(json), orphans_ref(json))
+
+    for symcount_txt in sorted(glob.glob(f'./{OUTDIR}/count.*/symcount.txt')):
+        print('checking',symcount_txt)
+        check_count_results(symcount_txt)
 
 if __name__ == '__main__':
     main()
