@@ -3,8 +3,17 @@
 #include <cstdint>
 #include <atomic>
 #include <cstdio>
+#include <map>
 
+#ifndef FUNCOUNT_PAGE_TABLES
+#define FUNCOUNT_PAGE_TABLES 1
+#endif
+
+#ifdef __clang__
+#define NOINSTR __attribute__((xray_never_instrument)) __attribute__((no_instrument_function))
+#else
 #define NOINSTR __attribute__((no_instrument_function))
+#endif
 #define INLINE __attribute__((always_inline))
 
 const int PAGE_BITS = 16; //works for a 2-level page table with 48b virtual addresses
@@ -39,8 +48,8 @@ struct CountsPagesL1
     NOINSTR CountsPagesL1() { memset(pages, 0, sizeof(pages)); }
 };
 
-thread_local CountsPagesL1* g_freshPagesL1 = nullptr;
-thread_local CountsPage* g_freshPage = nullptr;
+static thread_local CountsPagesL1* g_freshPagesL1 = nullptr;
+static thread_local CountsPage* g_freshPage = nullptr;
 
 struct CountsPagesL2
 {
@@ -89,13 +98,22 @@ struct CountsPagesL2
     NOINSTR ~CountsPagesL2();
 };
 
-static CountsPagesL2 g_page_tab;
+static CountsPagesL2 g_page_tab[FUNCOUNT_PAGE_TABLES];
+
+static thread_local int g_rand_state = 0;
+
+static inline int INLINE NOINSTR lcg_rand()
+{
+     int next = (1103515245 * g_rand_state + 12345) & 0x7fffffff;
+     g_rand_state = next;
+     return next;
+}
 
 extern "C" void NOINSTR __cyg_profile_func_enter(void* func, void* caller)
 {
     static_assert(sizeof(count_t) == sizeof(std::atomic<count_t>), "wrong size of atomic<count_t>");
     uint64_t addr = (uint64_t)func;
-    std::atomic<count_t>& count = g_page_tab.get_count(addr);
+    std::atomic<count_t>& count = g_page_tab[lcg_rand() % FUNCOUNT_PAGE_TABLES].get_count(addr);
     count += 1;
 }
 
@@ -104,6 +122,9 @@ extern "C" void NOINSTR __cyg_profile_func_exit(void* func, void* caller) {}
 #include <fstream>
 #include <vector>
 #include <iostream>
+
+static int g_destroyed_pages = 0;
+static std::map<uint64_t, uint64_t> g_addr2count;
 
 NOINSTR CountsPagesL2::~CountsPagesL2()
 {
@@ -134,12 +155,18 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
                         auto& count = page->counts[lo];
                         if(count) {
                             uint64_t address = (hi << PAGE_BITS*2) | (mid << PAGE_BITS) | (lo * sizeof(count_t));
-                            out << std::hex << "0x" << address << ' ' << std::dec << count << '\n';
+                            g_addr2count[address] += count;
                         }
                     }
                 }
             }
         }
     }
-    std::cout << "function call count report saved to funcount.txt" << std::endl;
+    g_destroyed_pages++;
+    if(g_destroyed_pages == FUNCOUNT_PAGE_TABLES) {
+        for(const auto& p : g_addr2count) {
+            out << std::hex << "0x" << p.first << ' ' << std::dec << p.second << '\n';
+        }
+        std::cout << "function call count report saved to funcount.txt" << std::endl;
+    }
 }
