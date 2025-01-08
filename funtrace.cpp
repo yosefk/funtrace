@@ -400,8 +400,8 @@ static void NOINSTR write_ftrace(std::ostream& file, const std::vector<std::stri
 
 //finding the executable segments using dl_iterate_phdr() is faster than reading /proc/self/maps
 //and produces less segments since we ignore the non-executable ones
-static int phdr_callback (struct dl_phdr_info *info,
-                          size_t size, void *data) {
+static int NOINSTR phdr_callback (struct dl_phdr_info *info, size_t size, void *data)
+{
     std::stringstream& s = *(std::stringstream*)data;
     for(int i=0; i<info->dlpi_phnum; ++i ) {
         const auto& phdr = info->dlpi_phdr[i];

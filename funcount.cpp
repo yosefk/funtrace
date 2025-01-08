@@ -44,55 +44,44 @@ struct CountsPage
 
 struct CountsPagesL1
 {
-    std::atomic<CountsPage*> pages[PAGE_SIZE];
+    CountsPage* pages[PAGE_SIZE];
     NOINSTR CountsPagesL1() { memset(pages, 0, sizeof(pages)); }
 };
 
-static thread_local CountsPagesL1* g_freshPagesL1 = nullptr;
-static thread_local CountsPage* g_freshPage = nullptr;
-
 struct CountsPagesL2
 {
-    std::atomic<CountsPagesL1*> pagesL1[PAGE_SIZE];
-    NOINSTR CountsPagesL2() { memset(pagesL1, 0, sizeof(pagesL1)); }
+    CountsPagesL1* pagesL1[PAGE_SIZE];
+    void NOINSTR init() { memset(pagesL1, 0, sizeof(pagesL1)); }
 
-    //this is "honestly" thread safe; it might be faster if it only returned an atomic
-    //counter but allowed 2 threads to notice that a page wasn't allocated and
-    //allocate it concurrently, with one of the threads losing the counts which
-    //would be accumulated in its page which would be lost to the other thread
-    //writing the page pointer to pagesL1[] or pages[] arrays. but this thing
-    //probably needs to be trustworthy a bit more than it needs to be fast
-    //(you collect the counts mainly to decide which functions to not instrument
-    //with funtrace tracing; you don't do this often so slowness is not that bad
-    //in most cases whereas wondering about correctness is annoying. if slowness
-    //makes the flow unusable for you you can try replacing atomic<T*> with plain T*)
+    void NOINSTR allocate_range(uint64_t base, uint64_t size)
+    {
+        uint64_t start = base & ~PAGE_BITS_MASK;
+        uint64_t end = (base + size + PAGE_SIZE - 1) & ~PAGE_BITS_MASK;
+        for(uint64_t address=start; address<=end; address+=PAGE_SIZE) {
+            auto high = high_bits(address);
+            auto& pages = pagesL1[high];
+            if(!pages) {
+                pages = new CountsPagesL1;
+            }
+
+            auto mid = mid_bits(address);
+            auto& page = pages->pages[mid];
+            if(!page) {
+                page = new CountsPage;
+            }
+        }
+    }
+
     std::atomic<count_t>& INLINE NOINSTR get_count(uint64_t address)
     {
-        //this and the next similar if test could be avoded by interposing pthread_create
-        //and initializing the TLS variables (or using ctors but that's even worse
-        //than the if statements in the generated code); probably not worth it
-        //given the much costlier stuff like the 3 atomic operations we have
-        if(!g_freshPagesL1) {
-            g_freshPagesL1 = new CountsPagesL1;
-        }
         auto high = high_bits(address);
-        auto& pages = pagesL1[high];
-        CountsPagesL1* nullPages = nullptr;
-        if(pages.compare_exchange_strong(nullPages, g_freshPagesL1)) {
-            g_freshPagesL1 = new CountsPagesL1;
-        }
+        auto pages = pagesL1[high];
 
-        if(!g_freshPage) {
-            g_freshPage = new CountsPage;
-        }
         auto mid = mid_bits(address);
-        auto& page = pages.load()->pages[mid];
-        CountsPage* nullPage = nullptr;
-        if(page.compare_exchange_strong(nullPage, g_freshPage)) {
-            g_freshPage = new CountsPage;
-        }
+        auto page = pages->pages[mid];
+
         auto low = low_bits(address);
-        return page.load()->counts[low / sizeof(count_t)];
+        return page->counts[low / sizeof(count_t)];
     }
 
     NOINSTR ~CountsPagesL2();
@@ -113,7 +102,8 @@ extern "C" void NOINSTR __cyg_profile_func_enter(void* func, void* caller)
 {
     static_assert(sizeof(count_t) == sizeof(std::atomic<count_t>), "wrong size of atomic<count_t>");
     uint64_t addr = (uint64_t)func;
-    std::atomic<count_t>& count = g_page_tab[lcg_rand() % FUNCOUNT_PAGE_TABLES].get_count(addr);
+    int tab_ind = FUNCOUNT_PAGE_TABLES == 1 ? 0 : lcg_rand() % FUNCOUNT_PAGE_TABLES;
+    std::atomic<count_t>& count = g_page_tab[tab_ind].get_count(addr);
     count += 1;
 }
 
@@ -146,16 +136,21 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
     out << "COUNTS\n";
 
     for(uint64_t hi=0; hi<PAGE_SIZE; ++hi) {
-        auto pages = pagesL1[hi].load();
+        auto pages = pagesL1[hi];
         if(pages) {
             for(uint64_t mid=0; mid<PAGE_SIZE; ++mid) {
-                auto page = pages->pages[mid].load();
+                auto page = pages->pages[mid];
                 if(page) {
                     for(uint64_t lo=0; lo<PAGE_SIZE/sizeof(count_t); ++lo) {
                         auto& count = page->counts[lo];
                         if(count) {
                             uint64_t address = (hi << PAGE_BITS*2) | (mid << PAGE_BITS) | (lo * sizeof(count_t));
-                            g_addr2count[address] += count;
+                            if(FUNCOUNT_PAGE_TABLES == 1) {
+                                out << std::hex << "0x" << address << ' ' << std::dec << count << '\n';
+                            }
+                            else {
+                                g_addr2count[address] += count;
+                            }
                         }
                     }
                 }
@@ -164,9 +159,53 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
     }
     g_destroyed_pages++;
     if(g_destroyed_pages == FUNCOUNT_PAGE_TABLES) {
-        for(const auto& p : g_addr2count) {
-            out << std::hex << "0x" << p.first << ' ' << std::dec << p.second << '\n';
+        if(FUNCOUNT_PAGE_TABLES > 1) {
+            for(const auto& p : g_addr2count) {
+                out << std::hex << "0x" << p.first << ' ' << std::dec << p.second << '\n';
+            }
         }
         std::cout << "function call count report saved to funcount.txt" << std::endl;
     }
 }
+
+#include <link.h>
+#include <sstream>
+
+//finding the executable segments using dl_iterate_phdr() is faster than reading /proc/self/maps
+//and produces less segments since we ignore the non-executable ones
+static int NOINSTR phdr_callback (struct dl_phdr_info *info, size_t size, void *data)
+{
+    for(int i=0; i<info->dlpi_phnum; ++i ) {
+        const auto& phdr = info->dlpi_phdr[i];
+        //we only care about loadable executable segments (the likes of .text)
+        if(phdr.p_type == PT_LOAD && (phdr.p_flags & PF_X)) {
+            uint64_t start_addr = info->dlpi_addr + phdr.p_vaddr;
+            for(int t=0; t<FUNCOUNT_PAGE_TABLES; ++t) {
+                g_page_tab[t].allocate_range(start_addr, phdr.p_memsz);
+            }
+        }
+    }
+    return 0;
+}
+
+static void NOINSTR allocate_page_tables()
+{
+    dl_iterate_phdr(phdr_callback, nullptr);
+}
+
+
+__attribute__((constructor(101))) void NOINSTR main_init(void)
+{
+    for(int t=0; t<FUNCOUNT_PAGE_TABLES; ++t) {
+        g_page_tab[t].init();
+    }
+    allocate_page_tables();
+}
+
+/*
+extern "C" void NOINSTR dlopen(const char *filename, int flags)
+{
+    void (*orig)(const char*,int) = (void (*)(const char*,int))dlsym(RTLD_NEXT, "dlopen");
+    (*orig)(filename, flags);
+    allocate_page_tables();
+}*/
