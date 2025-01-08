@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdio>
 #include <map>
+#include <x86intrin.h>
 
 #ifndef FUNCOUNT_PAGE_TABLES
 #define FUNCOUNT_PAGE_TABLES 1
@@ -51,7 +52,13 @@ struct CountsPagesL1
 struct CountsPagesL2
 {
     CountsPagesL1* pagesL1[PAGE_SIZE];
-    void NOINSTR init() { memset(pagesL1, 0, sizeof(pagesL1)); }
+    std::atomic<count_t> unknown;
+
+    void NOINSTR init()
+    {
+        memset(pagesL1, 0, sizeof(pagesL1));
+        unknown = 0;
+    }
 
     void NOINSTR allocate_range(uint64_t base, uint64_t size)
     {
@@ -76,9 +83,15 @@ struct CountsPagesL2
     {
         auto high = high_bits(address);
         auto pages = pagesL1[high];
+        if(!pages) {
+            return unknown;
+        }
 
         auto mid = mid_bits(address);
         auto page = pages->pages[mid];
+        if(!page) {
+            return unknown;
+        }
 
         auto low = low_bits(address);
         return page->counts[low / sizeof(count_t)];
@@ -89,20 +102,18 @@ struct CountsPagesL2
 
 static CountsPagesL2 g_page_tab[FUNCOUNT_PAGE_TABLES];
 
-static thread_local int g_rand_state = 0;
-
-static inline int INLINE NOINSTR lcg_rand()
+static inline unsigned int INLINE NOINSTR core_num()
 {
-     int next = (1103515245 * g_rand_state + 12345) & 0x7fffffff;
-     g_rand_state = next;
-     return next;
+    unsigned int aux;
+    __rdtscp(&aux);
+    return aux & 0xfff;
 }
 
 extern "C" void NOINSTR __cyg_profile_func_enter(void* func, void* caller)
 {
     static_assert(sizeof(count_t) == sizeof(std::atomic<count_t>), "wrong size of atomic<count_t>");
     uint64_t addr = (uint64_t)func;
-    int tab_ind = FUNCOUNT_PAGE_TABLES == 1 ? 0 : lcg_rand() % FUNCOUNT_PAGE_TABLES;
+    int tab_ind = FUNCOUNT_PAGE_TABLES == 1 ? 0 : core_num() % FUNCOUNT_PAGE_TABLES;
     std::atomic<count_t>& count = g_page_tab[tab_ind].get_count(addr);
     count += 1;
 }
@@ -112,9 +123,6 @@ extern "C" void NOINSTR __cyg_profile_func_exit(void* func, void* caller) {}
 #include <fstream>
 #include <vector>
 #include <iostream>
-
-static int g_destroyed_pages = 0;
-static std::map<uint64_t, uint64_t> g_addr2count;
 
 NOINSTR CountsPagesL2::~CountsPagesL2()
 {
@@ -135,6 +143,9 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
     out.write(&maps_data[0], maps_data.size());
     out << "COUNTS\n";
 
+    //the first object in the array is constructed first and destroyed last -
+    auto last_page_tab = &g_page_tab[0];
+
     for(uint64_t hi=0; hi<PAGE_SIZE; ++hi) {
         auto pages = pagesL1[hi];
         if(pages) {
@@ -145,11 +156,13 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
                         auto& count = page->counts[lo];
                         if(count) {
                             uint64_t address = (hi << PAGE_BITS*2) | (mid << PAGE_BITS) | (lo * sizeof(count_t));
-                            if(FUNCOUNT_PAGE_TABLES == 1) {
+                            if(this == last_page_tab) {
+                                //print the final counts
                                 out << std::hex << "0x" << address << ' ' << std::dec << count << '\n';
                             }
                             else {
-                                g_addr2count[address] += count;
+                                //accumulate the results into the first page table
+                                last_page_tab->get_count(address) += count;
                             }
                         }
                     }
@@ -157,13 +170,15 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
             }
         }
     }
-    g_destroyed_pages++;
-    if(g_destroyed_pages == FUNCOUNT_PAGE_TABLES) {
-        if(FUNCOUNT_PAGE_TABLES > 1) {
-            for(const auto& p : g_addr2count) {
-                out << std::hex << "0x" << p.first << ' ' << std::dec << p.second << '\n';
-            }
+    if(unknown) {
+        if(this == last_page_tab) {
+            std::cout << "WARNING: " << unknown << " function calls were to addresses in unknown parts of the address space (constructors in dynamic libraries loaded with dlopen?)" << std::endl;
         }
+        else {
+            last_page_tab->unknown += unknown;
+        }
+    }
+    if(this == last_page_tab) {
         std::cout << "function call count report saved to funcount.txt" << std::endl;
     }
 }
@@ -193,7 +208,6 @@ static void NOINSTR allocate_page_tables()
     dl_iterate_phdr(phdr_callback, nullptr);
 }
 
-
 __attribute__((constructor(101))) void NOINSTR main_init(void)
 {
     for(int t=0; t<FUNCOUNT_PAGE_TABLES; ++t) {
@@ -202,10 +216,18 @@ __attribute__((constructor(101))) void NOINSTR main_init(void)
     allocate_page_tables();
 }
 
-/*
-extern "C" void NOINSTR dlopen(const char *filename, int flags)
+extern "C" void* NOINSTR dlopen(const char *filename, int flags)
 {
-    void (*orig)(const char*,int) = (void (*)(const char*,int))dlsym(RTLD_NEXT, "dlopen");
-    (*orig)(filename, flags);
+    void* (*orig)(const char*,int) = (void* (*)(const char*,int))dlsym(RTLD_NEXT, "dlopen");
+    void* lib = (*orig)(filename, flags);
     allocate_page_tables();
-}*/
+    return lib;
+}
+
+extern "C" void* NOINSTR dlmopen(Lmid_t lmid, const char *filename, int flags)
+{
+    void* (*orig)(Lmid_t,const char*,int) = (void* (*)(Lmid_t,const char*,int))dlsym(RTLD_NEXT, "dlmopen");
+    void* lib = (*orig)(lmid, filename, flags);
+    allocate_page_tables();
+    return lib;
+}
