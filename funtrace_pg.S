@@ -1,3 +1,7 @@
+#ifdef FUNTRACE_FUNCOUNT
+#include "funcount_pg.S"
+#else
+
 #include "funtrace_buf_size.h"
 
         .p2align 4
@@ -126,3 +130,4 @@ exe_xray_FunctionTailExit:
         .size   exe_xray_FunctionExit, .-exe_xray_FunctionExit
         .size   __xray_FunctionTailExit, .-__xray_FunctionTailExit
         .size   exe_xray_FunctionTailExit, .-exe_xray_FunctionTailExit
+#endif

@@ -4,6 +4,11 @@ volatile int shared_n;
 
 char buf[256*1024]={1};
 
+struct glob
+{
+    glob() { shared_n++; }
+} gg;
+
 void NI f_shared()
 {
     shared_n++;

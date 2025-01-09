@@ -145,25 +145,27 @@ extern "C" void NOINSTR __cyg_profile_func_exit(void* func, void* caller) {}
 
 NOINSTR CountsPagesL2::~CountsPagesL2()
 {
-    std::ofstream out("funcount.txt");
-    out << "FUNCOUNT\nPROCMAPS\n";
-    std::ifstream maps_file("/proc/self/maps", std::ios::binary);
-    if (!maps_file.is_open()) {
-        std::cerr << "funtrace - failed to open /proc/self/maps, traces will be impossible to decode" << std::endl;
-        return;
-    }
-
-    std::vector<char> maps_data(
-        (std::istreambuf_iterator<char>(maps_file)),
-        std::istreambuf_iterator<char>());
-
-    maps_file.close();
-
-    out.write(&maps_data[0], maps_data.size());
-    out << "COUNTS\n";
-
     //the first object in the array is constructed first and destroyed last -
     auto last_page_tab = &g_page_tab[0];
+
+    std::ofstream out;
+    if(this == last_page_tab) {
+        out.open("funcount.txt");
+        out << "FUNCOUNT\nPROCMAPS\n";
+        std::ifstream maps_file("/proc/self/maps", std::ios::binary);
+        if (!maps_file.is_open()) {
+            std::cerr << "funtrace - failed to open /proc/self/maps, traces will be impossible to decode" << std::endl;
+            return;
+        }
+
+        std::vector<char> maps_data(
+            (std::istreambuf_iterator<char>(maps_file)),
+            std::istreambuf_iterator<char>());
+
+        maps_file.close();
+        out.write(&maps_data[0], maps_data.size());
+        out << "COUNTS\n";
+    }
 
     for(uint64_t hi=0; hi<PAGE_SIZE; ++hi) {
         auto pages = pagesL1[hi];
@@ -186,7 +188,9 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
                         }
                     }
                 }
+                delete page;
             }
+            delete pages;
         }
     }
     if(unknown) {

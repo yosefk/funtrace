@@ -166,13 +166,15 @@ class symcount:
         for line,t in self.lines:
             if func in line:
                 return funinfo(line,t)
+        return funinfo('none',[0,0,0,'??','??:0'])
 
 def parse_symcount_txt(f):
     return symcount(open(f).read().strip().split('\n'))
 
 def check_count_results(symcount_txt):
     counts = parse_symcount_txt(symcount_txt)
-    for name,c in [('f',9000),('g',3000),('h',3000)]:
+    iters = 1000 
+    for name,c in [('f',iters*9),('g',iters*3),('h',iters*3)]:
         fname = name+'()'
         info = counts.info(fname)
         assert info.count == c, f'wrong count for {fname}: expected {c}, got {info.count}'
@@ -183,6 +185,12 @@ def check_count_results(symcount_txt):
         info = counts.info(fname)
         assert info.count == c, f'wrong count for {fname}: expected {c}, got {info.count}'
         assert 'count_shared.cpp' in info.file
+        assert '.so' in info.module
+
+        fname = name+'_dyn_shared()'
+        info = counts.info(fname)
+        assert info.count == c, f'wrong count for {fname}: expected {c}, got {info.count}'
+        assert 'count_dyn_shared.cpp' in info.file
         assert '.so' in info.module
 
 def system(cmd):
@@ -204,8 +212,6 @@ def build_cxx_test(main, shared=[], dyn_shared=[], flags=''):
     cmdlists = []
     binaries = {}
     for mode in ['fi-gcc','fi-clang','pg','xray']:
-        if 'count' in main and 'fi' not in mode:
-            continue # FIXME!!
         CXXFLAGS=f"-O3 -std=c++11 -Wall {flags}"
         if mode == 'xray':
             CXXFLAGS += " -fxray-instruction-threshold=1"
@@ -226,8 +232,8 @@ def build_cxx_test(main, shared=[], dyn_shared=[], flags=''):
                 module = cpp.split('.')[0]
                 lib = f'{os.path.realpath(BUILDDIR)}/{module}.{mode}.so'
                 cmds += [
-                    f'{CXX} -c tests/{cpp} -o {BUILDDIR}/{module}.mode.o {CXXFLAGS} -I. -fPIC',
-                    f'{CXX} -o {lib} {BUILDDIR}/{module}.mode.o {CXXFLAGS} -fPIC -shared',
+                    f'{CXX} -c tests/{cpp} -o {BUILDDIR}/{module}.{mode}.o {CXXFLAGS} -I. -fPIC',
+                    f'{CXX} -o {lib} {BUILDDIR}/{module}.{mode}.o {CXXFLAGS} -fPIC -shared',
                 ]
                 if cpp in dyn_shared:
                     DYNLIBS += ' '+lib
@@ -253,7 +259,7 @@ def run_cxx_test(test, binaries):
             env = 'env XRAY_OPTIONS="patch_premain=true"' 
         cmds = [
             f'mkdir -p {OUTDIR}/{name}',
-            f'cd {OUTDIR}/{name}; {env} ../../{binary}',
+            f'cd {OUTDIR}/{name}; {env} ../../{binary} | tee stdout',
         ]
         if 'count' in test:
             cmds += [

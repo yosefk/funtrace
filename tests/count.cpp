@@ -32,9 +32,11 @@ void NI h()
 void h_shared();
 void (*h_shared_2)();
 
+const int64_t iters = 1000;
+
 void loop()
 {
-    for(int i=0; i<1000; ++i) {
+    for(int64_t i=0; i<iters; ++i) {
         h();
         h_shared();
         h_shared_2();
