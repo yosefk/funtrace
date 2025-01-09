@@ -188,8 +188,10 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
                         }
                     }
                 }
+                pages->pages[mid] = nullptr;
                 delete page;
             }
+            pagesL1[hi] = nullptr;
             delete pages;
         }
     }
