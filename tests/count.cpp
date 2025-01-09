@@ -1,4 +1,9 @@
 #include <thread>
+#include <dlfcn.h>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 #include "test.h"
 
 //TODO: add threads and sos
@@ -25,17 +30,22 @@ void NI h()
 }
 
 void h_shared();
+void (*h_shared_2)();
 
 void loop()
 {
     for(int i=0; i<1000; ++i) {
         h();
         h_shared();
+        h_shared_2();
     }
 }
 
 int main()
 {
+    void* lib = dlopen(LIBS, RTLD_NOW);
+    h_shared_2 = (void (*)())dlsym(lib, "h_dyn_shared_c");
+
     std::thread t([] {
         loop();
     });

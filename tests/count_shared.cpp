@@ -2,6 +2,8 @@
 
 volatile int shared_n;
 
+char buf[256*1024]={1};
+
 void NI f_shared()
 {
     shared_n++;

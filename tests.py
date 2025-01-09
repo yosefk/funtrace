@@ -200,7 +200,7 @@ def run_cmds(cmds):
     for cmd in cmds:
         system(cmd)
 
-def build_cxx_test(main, shared=[], flags=''):
+def build_cxx_test(main, shared=[], dyn_shared=[], flags=''):
     cmdlists = []
     binaries = {}
     for mode in ['fi-gcc','fi-clang','pg','xray']:
@@ -220,17 +220,24 @@ def build_cxx_test(main, shared=[], flags=''):
         binary = f'{BUILDDIR}/{test}.{mode}'
         cmds = []
         LIBS = ''
-        if shared:
-            for cpp in shared:
+        DYNLIBS = ''
+        if shared or dyn_shared:
+            for cpp in shared+dyn_shared:
                 module = cpp.split('.')[0]
                 lib = f'{os.path.realpath(BUILDDIR)}/{module}.{mode}.so'
                 cmds += [
                     f'{CXX} -c tests/{cpp} -o {BUILDDIR}/{module}.mode.o {CXXFLAGS} -I. -fPIC',
                     f'{CXX} -o {lib} {BUILDDIR}/{module}.mode.o {CXXFLAGS} -fPIC -shared',
                 ]
-                LIBS += ' '+lib
+                if cpp in dyn_shared:
+                    DYNLIBS += ' '+lib
+                else:
+                    LIBS += ' '+lib
+        dlibs = ''
+        if LIBS:
+            dlibs = f'-DLIBS=\\"{DYNLIBS.strip()}\\"'
         cmds += [
-            f'{CXX} -c tests/{main} -o {BUILDDIR}/{test}.{mode}.o {CXXFLAGS} -I.',
+            f'{CXX} -c tests/{main} -o {BUILDDIR}/{test}.{mode}.o {CXXFLAGS} -I. {dlibs}',
             f'{CXX} -o {binary} {BUILDDIR}/{test}.{mode}.o {CXXFLAGS}{LIBS}',
         ]
         cmdlists.append(cmds)
@@ -279,7 +286,7 @@ def main():
     buildcmds('longjmp.cpp')
     buildcmds('tailcall.cpp')
     buildcmds('orphans.cpp')
-    buildcmds('count.cpp',shared=['count_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT')
+    buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)
 
     cmdlists = []

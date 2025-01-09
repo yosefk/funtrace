@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdio>
 #include <map>
+#include <link.h>
 #include <x86intrin.h>
 
 #ifndef FUNCOUNT_PAGE_TABLES
@@ -52,6 +53,24 @@ struct CountsPagesL1
 struct CountsPagesL2
 {
     CountsPagesL1* pagesL1[PAGE_SIZE];
+    //this counts function calls in executable segments not mapped at the time
+    //when the code was running (allocate_range() wasn't called); AFAIK this
+    //should be limited to constructors in shared objects (which get called
+    //before we get a chance to call dl_iterate_phdr() to update our view
+    //of the address space)
+    //
+    //note that these misses could be avoided by allocating the pages on demand
+    //when a function is first called; however this slows things down even
+    //if it's done in a non-thread-safe manner (potentially leaking pages and
+    //losing call counts) and more so if it's done with in a thread-safe way
+    //(we have a commit in the history doing this with 2 compare_exchange_strong()
+    //calls.) for the purpose of finding the most commonly called functions
+    //in order to exclude them from funtrace instrumentation, it's probably better
+    //to limit the slowdown (s.t. interactive / real-time flows have some chance
+    //of being usable for collecting statistics) at the expense of missing
+    //constructor calls in dynamic libraries (which are very unlikely to be
+    //where you badly need to suppress funtrace instrumentation because of
+    //its overhead)
     std::atomic<count_t> unknown;
 
     void NOINSTR init()
@@ -172,7 +191,7 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
     }
     if(unknown) {
         if(this == last_page_tab) {
-            std::cout << "WARNING: " << unknown << " function calls were to addresses in unknown parts of the address space (constructors in dynamic libraries loaded with dlopen?)" << std::endl;
+            std::cout << "WARNING: " << unknown << " function calls were to functions in parts of the address space unknown at the time they were made (likely constructors in shared objects)" << std::endl;
         }
         else {
             last_page_tab->unknown += unknown;
@@ -183,16 +202,10 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
     }
 }
 
-#include <link.h>
-#include <sstream>
-
-//finding the executable segments using dl_iterate_phdr() is faster than reading /proc/self/maps
-//and produces less segments since we ignore the non-executable ones
 static int NOINSTR phdr_callback (struct dl_phdr_info *info, size_t size, void *data)
 {
     for(int i=0; i<info->dlpi_phnum; ++i ) {
         const auto& phdr = info->dlpi_phdr[i];
-        //we only care about loadable executable segments (the likes of .text)
         if(phdr.p_type == PT_LOAD && (phdr.p_flags & PF_X)) {
             uint64_t start_addr = info->dlpi_addr + phdr.p_vaddr;
             for(int t=0; t<FUNCOUNT_PAGE_TABLES; ++t) {
@@ -208,13 +221,14 @@ static void NOINSTR allocate_page_tables()
     dl_iterate_phdr(phdr_callback, nullptr);
 }
 
-__attribute__((constructor(101))) void NOINSTR main_init(void)
+__attribute__((constructor(101))) void NOINSTR funcount_init()
 {
     for(int t=0; t<FUNCOUNT_PAGE_TABLES; ++t) {
         g_page_tab[t].init();
     }
     allocate_page_tables();
 }
+
 
 extern "C" void* NOINSTR dlopen(const char *filename, int flags)
 {
@@ -223,6 +237,7 @@ extern "C" void* NOINSTR dlopen(const char *filename, int flags)
     allocate_page_tables();
     return lib;
 }
+
 
 extern "C" void* NOINSTR dlmopen(Lmid_t lmid, const char *filename, int flags)
 {
