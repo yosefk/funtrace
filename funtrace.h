@@ -72,6 +72,11 @@ void funtrace_write_snapshot(const char* filename, struct funtrace_snapshot* sna
    with tracing enabled */
 void funtrace_ignore_this_thread();
 
+/* set this thread's buffer size (must be a power of 2, so defined by a log value,
+   which must be larger the log of the size of 2 events;
+   using a smaller value is equivalent to callung funtrace_ignore_this_thread()). */
+void funtrace_set_thread_log_buf_size(int log_buf_size);
+
 /* disabling tracing will speed things up slightly. note that we don't
    free the buffers when disabling tracing and don't reallocate them
    when enabling tracing. funtrace_ignore_this_thread() is how you free

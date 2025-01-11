@@ -24,7 +24,22 @@
 #include <sys/resource.h>
 #include "funtrace.h"
 #include <link.h>
-#include "funtrace_buf_size.h"
+#include "funtrace_flags.h"
+
+//buffer sizes - configurable with #defines and env vars
+//(and for function call tracing, on a per thread basis)
+
+//the ftrace events buffer size is set in the number of events, not in bytes.
+//in a test 20K events took about 1MB but YMMV
+#ifndef FUNTRACE_FTRACE_EVENTS_IN_BUF
+#define FUNTRACE_FTRACE_EVENTS_IN_BUF 20000
+#endif
+
+//the buffer size is in bytes. the size of an event in the current implementation
+//is 32 bytes. the size is defined as a log (the size must be a power of 2)
+#ifndef FUNTRACE_LOG_BUF_SIZE
+#define FUNTRACE_LOG_BUF_SIZE 20
+#endif
 
 //we could ask the user to compile this file without -finstrument-functions/-pg
 //instead of peppering all of the code with NOINSTR. but this file wants
@@ -40,11 +55,7 @@
 //put NOINSTR on them...
 #define NOINSTR NOFUNTRACE
 
-//(#define macros aren't visible with plain -g and need fancier flags that most
-//build systems don't pass; and FUNTRACE_BUF_SIZE must be a #define
-//to be useable from funtrace_pg.s)
-
-//if you modify this, update funtrace_pg.S as well
+//if you modify this struct, update funtrace_pg.S as well
 struct trace_entry
 {
     void* func;
@@ -58,36 +69,56 @@ struct thread_id
     char name[16];
 };
 
+
+static int NOINSTR default_log_buf_size()
+{
+    //0 disables tracing
+    const char* env = "FUNTRACE_LOG_BUF_SIZE";
+    static int value = getenv(env) ? atoi(getenv(env)) : FUNTRACE_LOG_BUF_SIZE;
+    return value;
+}
+
 struct trace_data
 {
-    trace_entry* pos; //pos points into buf which must be aligned to FUNTRACE_BUF_SIZE
-    bool enabled;
+    trace_entry* pos; //pos points into buf which must be aligned to buf_size*2
+    uint64_t wraparound_mask; //this is occasionally set to 0 to temporarily disable tracing;
     trace_entry* buf;
+    uint64_t buf_size;
     pthread_t thread;
     thread_id id;
 
-    inline void NOINSTR pause_tracing() { enabled = false; }
-    inline void NOINSTR resume_tracing() { enabled = true; }
+    inline void NOINSTR pause_tracing() { wraparound_mask = 0; }
+    inline void NOINSTR resume_tracing() { wraparound_mask = ~buf_size; }
 
-    void NOINSTR allocate()
+    void NOINSTR allocate(int log_buf_size=0)
     {
-        trace_entry* entries = nullptr;
+        if(log_buf_size == 0) {
+            log_buf_size = default_log_buf_size();
+        }
         //we align the allocation to twice the buffer size so that after we increment the pos pointer,
         //we can clear the bit FUNTRACE_LOG_BUF_SIZE without worrying that the increment
         //carried values to bits at higher positions
-        int memret = posix_memalign((void**)&entries, FUNTRACE_BUF_SIZE*2, FUNTRACE_BUF_SIZE);
-        (void)memret;
-        buf = entries;
-        pos = entries;
-        enabled = true;
+        if(log_buf_size) {
+            buf_size = 1<<log_buf_size;
+            wraparound_mask = ~buf_size;
+            trace_entry* entries = nullptr;
+            int memret = posix_memalign((void**)&entries, buf_size*2, buf_size);
+            buf = pos = entries;
+            if(memret) { //allocation failed - disable tracing
+                buf_size = wraparound_mask = 0;
+            }
+        }
+        else {
+            buf_size = wraparound_mask = 0;
+            buf = pos = nullptr;
+        }
     }
 
     void NOINSTR free()
     {
         ::free(buf);
-        enabled = false;
-        buf = nullptr;
-        pos = nullptr;
+        buf_size = wraparound_mask = 0;
+        buf = pos = nullptr;
     }
 
     inline void NOINSTR trace(void* ptr, uint64_t is_ret);
@@ -102,15 +133,25 @@ inline void NOINSTR trace_data::trace(void* ptr, uint64_t flags)
 {
     static_assert(sizeof(trace_entry) == 16, "funtrace_pg.S assumes 16 byte trace_entry structs");
 
-    bool paused = !enabled;
+    //ANDing pos and wraparound_mask and testing the result creates nicely-looking code on x86
+    //where on one hand you run just 4 instructions when wraparound_mask==0 [trace disabled],
+    //and on the otehr hand you only add one instruction (je) to support early exit when
+    //the trace is disabled. not sure it is really always faster on x86 than testing wraparound_mask
+    //though and on other architectures you might want to do this a bit differently. in any case,
+    //for correctness it's OK to have entry+1 written to pos before ANDing with the mask,
+    //and it's also OK to AND and then store;
+    //what's NOT OK is loading wraparound_mask more than once - it might be zeroed by another
+    //thread, so you shouldn't test it and then reload it for ANDing with pos.
     trace_entry* entry = pos;
+    entry = (trace_entry*)(uint64_t(entry) & wraparound_mask);
+
+    if(!entry) {
+        return;
+    }
 
     uint64_t cycle = __rdtsc();
     uint64_t func = ((uint64_t)ptr) | flags;
 
-    if(paused) {
-        return;
-    }
     //this generates prefetchw and doesn't impact povray's runtime (with any of +4, 8, 12, 16)
     //__builtin_prefetch(entry+4, 1, 0);
 
@@ -127,10 +168,9 @@ inline void NOINSTR trace_data::trace(void* ptr, uint64_t flags)
     //__m128i xmm = _mm_set_epi64x(cycle, func);
     //_mm_stream_si128((__m128i*)entry, xmm);
 
-    entry = (trace_entry*)(uint64_t(entry + 1) & ~(1 << FUNTRACE_LOG_BUF_SIZE));
-    //printf("%p 0x%x\n", (void*)entry, uint64_t(entry) & (FUNTRACE_BUF_SIZE*2-1));
+    //printf("%p 0x%lx 0x%lx\n", (void*)entry, uint64_t(entry) & (buf_size*2-1), wraparound_mask);
 
-    pos = entry;
+    pos = entry+1;
 }
 
 thread_local trace_data g_thread_trace;
@@ -146,7 +186,7 @@ extern "C" void NOINSTR __cyg_profile_func_exit(void* func, void*) { g_thread_tr
 //not really any need to use assembly rather than C here
 //
 //(the other changes to funtrace_pg.S in addition to register renaming are
-//to put macros like FUNTRACE_LOG_BUF_SIZE instead of the constants generated by gcc)
+//to put macros like FUNTRACE_RETURN_BIT instead of the constants generated by gcc)
 #if 0
 extern "C" void NOINSTR __fentry__() {
     g_thread_trace.trace(__builtin_return_address(0),0);
@@ -195,8 +235,9 @@ struct trace_global_state
     uint64_t pid;
     std::string cmdline;
     uint64_t cpu_freq;
-    int buf_size = FUNTRACE_BUF_SIZE; //for funtrace_gdb.py
     char* exe_path = nullptr;
+    bool destroyed = false; //to guard against threads starting/finishing
+    //after this object is destroyed
 
     NOINSTR trace_global_state()
     {
@@ -208,6 +249,7 @@ struct trace_global_state
     NOINSTR ~trace_global_state()
     {
         ::free(exe_path);
+        destroyed = true;
     }
 
     std::ostream& NOINSTR file()
@@ -221,6 +263,9 @@ struct trace_global_state
     //can't be called more than once before unregister_this_thread()
     void NOINSTR register_this_thread()
     {
+        if(destroyed) {
+            return;
+        }
         std::lock_guard<std::mutex> guard(mutex);
         g_thread_trace.id.pid = pid;
         g_thread_trace.id.tid = gettid();
@@ -231,6 +276,9 @@ struct trace_global_state
     //safe to call many times without calling register_this_thread() between the calls
     void NOINSTR unregister_this_thread()
     {
+        if(destroyed) {
+            return;
+        }
         std::lock_guard<std::mutex> guard(mutex);
         for(int i=0; i<(int)thread_traces.size(); ++i) {
             if(thread_traces[i] == &g_thread_trace) {
@@ -443,7 +491,7 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     std::vector<event_buffer> traces;
     for(auto trace : g_trace_state.thread_traces) {
         trace->update_name();
-        traces.push_back(event_buffer{trace->buf, FUNTRACE_BUF_SIZE, trace->id});
+        traces.push_back(event_buffer{trace->buf, trace->buf_size, trace->id});
     }
     write_funtrace(file);
     write_tracebufs(file, traces);
@@ -477,10 +525,10 @@ funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
     }
     funtrace_snapshot* snapshot = new funtrace_snapshot;
     for(auto trace : g_trace_state.thread_traces) {
-        trace_entry* copy = (trace_entry*)new char[FUNTRACE_BUF_SIZE];
-        memcpy(copy, trace->buf, FUNTRACE_BUF_SIZE);
+        trace_entry* copy = (trace_entry*)new char[trace->buf_size];
+        memcpy(copy, trace->buf, trace->buf_size);
         trace->update_name();
-        snapshot->thread_traces.push_back(event_buffer{copy, FUNTRACE_BUF_SIZE, trace->id});
+        snapshot->thread_traces.push_back(event_buffer{copy, trace->buf_size, trace->id});
     }
     for(auto trace : g_trace_state.thread_traces) {
         trace->resume_tracing();
@@ -560,7 +608,7 @@ extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_sta
     for(auto trace : g_trace_state.thread_traces) {
         trace_entry* pos = trace->pos;
         trace_entry* buf = trace->buf;
-        trace_entry* end = buf + FUNTRACE_BUF_SIZE/sizeof(trace_entry);
+        trace_entry* end = buf + trace->buf_size/sizeof(trace_entry);
         trace_entry* earliest_right = find_earliest_event_after(pos, end, time, pause_time);
         trace_entry* earliest_left = find_earliest_event_after(buf, pos, time, pause_time);
         uint64_t entries = (earliest_left ? pos-earliest_left : 0) + (earliest_right ? end-earliest_right : 0);
@@ -595,6 +643,15 @@ extern "C" void NOINSTR funtrace_ignore_this_thread()
 {
     g_trace_state.unregister_this_thread();
     g_thread_trace.free();
+}
+
+extern "C" void NOINSTR funtrace_set_thread_log_buf_size(int log_buf_size)
+{
+    funtrace_ignore_this_thread();
+    if(log_buf_size >= 5) { //5 is log(sizeof(trace_entry)*2
+        g_thread_trace.allocate(log_buf_size);
+        g_trace_state.register_this_thread();
+    }
 }
 
 extern "C" void NOINSTR funtrace_disable_tracing()
@@ -851,7 +908,12 @@ struct ftrace_handler
             return;
         }
         mutex.lock();
-        events.resize(FUNTRACE_FTRACE_EVENTS_IN_BUF);
+        int events_in_buf = FUNTRACE_FTRACE_EVENTS_IN_BUF;
+        const char* env = getenv("FUNTRACE_FTRACE_EVENTS_IN_BUF");
+        if(env) {
+            events_in_buf = atoi(env);
+        }
+        events.resize(events_in_buf);
         thread = std::thread([this] {
             thread_func();
         });

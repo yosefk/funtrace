@@ -76,11 +76,11 @@ def write_funtrace(f):
     write_chunk(f, b'CMD LINE', cmdline.encode('utf-8'))
 
     thread_traces = get_vector_elements(gdb.parse_and_eval('g_trace_state.thread_traces'))
-    buf_size = trace_state['buf_size']
     for i, trace in enumerate(thread_traces):
         # separately add ftrace
         trace = trace.dereference()
         thread_id = trace['id']
+        buf_size = trace['buf_size']
         write_chunk(f, b'THREADID', bytes(gdb.selected_inferior().read_memory(thread_id.address, thread_id.type.sizeof)))
 
         buf = trace['buf']
