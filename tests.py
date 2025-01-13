@@ -298,6 +298,7 @@ def main():
     buildcmds('tailcall.cpp')
     buildcmds('orphans.cpp')
     buildcmds('buf_size.cpp')
+    buildcmds('benchmark.cpp')
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)
 

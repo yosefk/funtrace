@@ -124,6 +124,12 @@ struct trace_data
             if(memret) { //allocation failed - disable tracing
                 buf_size = wraparound_mask = 0;
             }
+            else {
+                //we don't want to spend time on clearing the entire buffer; we zero
+                //the last entry's cycle to be able to check whether wraparound occured,
+                //to avoid accessing uninitialized memory
+                buf[buf_size/sizeof(trace_entry)-1].cycle = 0;
+            }
         }
         else {
             buf_size = wraparound_mask = 0;
@@ -674,7 +680,8 @@ extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_sta
         trace_entry* pos = trace->pos;
         trace_entry* buf = trace->buf;
         trace_entry* end = buf + trace->buf_size/sizeof(trace_entry);
-        trace_entry* earliest_right = find_earliest_event_after(pos, end, time, pause_time);
+        //if we never had a wraparound, don't access uninitialized memory in an attempt to search to the right of pos
+        trace_entry* earliest_right = end[-1].cycle ? find_earliest_event_after(pos, end, time, pause_time) : nullptr;
         trace_entry* earliest_left = find_earliest_event_after(buf, pos, time, pause_time);
         uint64_t entries = (earliest_left ? pos-earliest_left : 0) + (earliest_right ? end-earliest_right : 0);
         trace_entry* copy = (trace_entry*)new char[entries*sizeof(trace_entry)];
@@ -986,7 +993,7 @@ void NOINSTR funtrace_gc::thread_func()
 
 struct ftrace_event
 {
-    NOINSTR ftrace_event() {}
+    NOINSTR ftrace_event() { timestamp=0; }
     NOINSTR ~ftrace_event() {}
 
     uint64_t timestamp;
