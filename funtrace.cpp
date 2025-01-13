@@ -22,8 +22,8 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/resource.h>
-#include "funtrace.h"
 #include <link.h>
+#include "funtrace.h"
 #include "funtrace_flags.h"
 
 //buffer sizes - configurable with #defines and env vars
@@ -40,6 +40,18 @@
 #ifndef FUNTRACE_LOG_BUF_SIZE
 #define FUNTRACE_LOG_BUF_SIZE 20
 #endif
+
+//when threads exit, their traces are kept around for this number of milliseconds
+//(or deleted immediately if it's set to 0.) this is useful because otherwise
+//recently finished threads are invisible in trace snapshots, which is misleading
+#ifndef FUNTRACE_GC_MAX_AGE_MS 
+#define FUNTRACE_GC_MAX_AGE_MS 300
+#endif
+
+#ifndef FUNTRACE_GC_PERIOD_MS
+#define FUNTRACE_GC_PERIOD_MS FUNTRACE_GC_MAX_AGE_MS
+#endif
+
 
 //we could ask the user to compile this file without -finstrument-functions/-pg
 //instead of peppering all of the code with NOINSTR. but this file wants
@@ -69,12 +81,16 @@ struct thread_id
     char name[16];
 };
 
+static int NOINSTR env_int(const char* env, int default_value)
+{
+    const char* val = getenv(env);
+    return val ? atoi(val) : default_value;
+}
 
 static int NOINSTR default_log_buf_size()
 {
     //0 disables tracing
-    const char* env = "FUNTRACE_LOG_BUF_SIZE";
-    static int value = getenv(env) ? atoi(getenv(env)) : FUNTRACE_LOG_BUF_SIZE;
+    static int value = env_int("FUNTRACE_LOG_BUF_SIZE", FUNTRACE_LOG_BUF_SIZE);
     return value;
 }
 
@@ -84,8 +100,9 @@ struct trace_data
     uint64_t wraparound_mask; //this is occasionally set to 0 to temporarily disable tracing;
     trace_entry* buf;
     uint64_t buf_size;
-    pthread_t thread;
+    pthread_t thread; //null for finished threads that need to be gc'd
     thread_id id;
+    uint64_t time_of_death_ms; //for about-to-be garbage-collected objects
 
     inline void NOINSTR pause_tracing() { wraparound_mask = 0; }
     inline void NOINSTR resume_tracing() { wraparound_mask = ~buf_size; }
@@ -125,7 +142,9 @@ struct trace_data
 
     void NOINSTR update_name()
     {
-        pthread_getname_np(thread, id.name, sizeof id.name);
+        if(thread) { //if !thread, this trace belongs to a finished thread
+            pthread_getname_np(thread, id.name, sizeof id.name);
+        }
     }
 };
 
@@ -222,6 +241,11 @@ static std::string NOINSTR get_cmdline()
 
 static uint64_t cpu_cycles_per_second();
 
+static uint64_t NOINSTR current_time_ms()
+{
+    return funtrace_time() / (cpu_cycles_per_second() / 1000);
+}
+
 struct trace_global_state
 {
     //a set is easier to erase from but slower to iterate over and we want
@@ -238,6 +262,10 @@ struct trace_global_state
     char* exe_path = nullptr;
     bool destroyed = false; //to guard against threads starting/finishing
     //after this object is destroyed
+    int gc_max_age_ms;
+    bool exiting = false; //when we're exiting the program we're no longer
+    //deferring the destruction of trace buffers to avoid memory leaks
+    //(not that it matters but it's extra noise in leak reporting tools)
 
     NOINSTR trace_global_state()
     {
@@ -245,11 +273,7 @@ struct trace_global_state
         cmdline = get_cmdline();
         cpu_freq = cpu_cycles_per_second();
         exe_path = realpath("/proc/self/exe", nullptr);
-    }
-    NOINSTR ~trace_global_state()
-    {
-        ::free(exe_path);
-        destroyed = true;
+        gc_max_age_ms = env_int("FUNTRACE_GC_MAX_AGE_MS", FUNTRACE_GC_MAX_AGE_MS);
     }
 
     std::ostream& NOINSTR file()
@@ -261,11 +285,10 @@ struct trace_global_state
     }
 
     //can't be called more than once before unregister_this_thread()
-    void NOINSTR register_this_thread()
+    void NOINSTR register_this_thread(int log_buf_size=0)
     {
-        if(destroyed) {
-            return;
-        }
+        g_thread_trace.allocate(log_buf_size);
+
         std::lock_guard<std::mutex> guard(mutex);
         g_thread_trace.id.pid = pid;
         g_thread_trace.id.tid = gettid();
@@ -274,23 +297,65 @@ struct trace_global_state
     }
 
     //safe to call many times without calling register_this_thread() between the calls
-    void NOINSTR unregister_this_thread()
+    void NOINSTR unregister_this_thread(bool defer_free=false)
     {
-        if(destroyed) {
-            return;
-        }
         std::lock_guard<std::mutex> guard(mutex);
         for(int i=0; i<(int)thread_traces.size(); ++i) {
             if(thread_traces[i] == &g_thread_trace) {
-                thread_traces[i] = thread_traces.back();
-                thread_traces.pop_back();
+                if(gc_max_age_ms == 0 || !defer_free || exiting) {
+                    //no GC - free this trace (which points to a soon-to-be-deallocated buffer)
+                    g_thread_trace.free();
+                    thread_traces[i] = thread_traces.back();
+                    thread_traces.pop_back();
+                }
+                else {
+                    //keep the trace - GC will delete it together with the buffer it points to later
+                    thread_traces[i] = new trace_data(g_thread_trace);
+                    thread_traces[i]->update_name();
+                    thread_traces[i]->thread = 0;
+                    thread_traces[i]->time_of_death_ms = current_time_ms();
+                }
                 break;
             }
         }
     }
+
+    void NOINSTR collect_garbage(bool exiting_program)
+    {
+        if(gc_max_age_ms == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(mutex);
+        if(exiting_program) {
+            exiting = true;
+        }
+        uint64_t now = current_time_ms();
+        for(int i=0; i<(int)thread_traces.size(); ++i) {
+            if(thread_traces[i]->thread) {
+                continue; //live thread
+            }
+            if(!exiting && thread_traces[i]->time_of_death_ms + gc_max_age_ms > now) {
+                continue; //recently finished thread
+            }
+            //garbage-collect this trace
+            thread_traces[i]->free();
+            delete thread_traces[i];
+
+            thread_traces[i] = thread_traces.back();
+            thread_traces.pop_back();
+            --i;
+        }
+    }
 };
 
-trace_global_state g_trace_state;
+//the reason we heap-allocate and leak this object instead of making it a regular
+//global variable is that threads might be terminating during the program destruction
+//sequence, and we need unregister_this_thread() to work, and similarly, we need
+//collect_garbage() to work and it can be called at any moment.
+static trace_global_state& NOINSTR trace_state() {
+    static trace_global_state& g_trace_state = *new trace_global_state;
+    return g_trace_state;
+}
 
 // the code below for getting the TSC frequency is straight from an LLM,
 // and I'm not sure when it doesn't work. when we see at runtime
@@ -382,7 +447,7 @@ static uint64_t NOINSTR cpu_cycles_per_second()
     return freq;
 }
 
-extern "C" uint64_t NOINSTR funtrace_ticks_per_second() { return g_trace_state.cpu_freq; }
+extern "C" uint64_t NOINSTR funtrace_ticks_per_second() { return trace_state().cpu_freq; }
 
 const int MAGIC_LEN = 8;
 
@@ -410,8 +475,8 @@ struct event_buffer
 
 static void NOINSTR write_funtrace(std::ostream& file)
 {
-    write_chunk(file, "FUNTRACE", &g_trace_state.cpu_freq, sizeof g_trace_state.cpu_freq);
-    write_chunk(file, "CMD LINE", g_trace_state.cmdline.c_str(), g_trace_state.cmdline.size());
+    write_chunk(file, "FUNTRACE", &trace_state().cpu_freq, sizeof trace_state().cpu_freq);
+    write_chunk(file, "CMD LINE", trace_state().cmdline.c_str(), trace_state().cmdline.size());
 }
 
 static void NOINSTR write_endtrace(std::ostream& file)
@@ -458,7 +523,7 @@ static int NOINSTR phdr_callback (struct dl_phdr_info *info, size_t size, void *
             //we print in "roughly" the format of /proc/self/maps, with arbitrary values for the fields we don't really care about
             uint64_t start_addr = info->dlpi_addr + phdr.p_vaddr;
             uint64_t end_addr = start_addr + phdr.p_memsz;
-            const char* name = info->dlpi_name[0] ? info->dlpi_name : g_trace_state.exe_path;
+            const char* name = info->dlpi_name[0] ? info->dlpi_name : trace_state().exe_path;
             s << start_addr << '-' << end_addr << " r-xp " << phdr.p_vaddr << " 0:0 0 " << name << '\n';
         }
     }
@@ -473,12 +538,12 @@ static void NOINSTR get_procmaps(std::stringstream& procmaps)
 
 extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
 {
-    std::lock_guard<std::mutex> guard(g_trace_state.mutex);
+    std::lock_guard<std::mutex> guard(trace_state().mutex);
 
-    for(auto trace : g_trace_state.thread_traces) {
+    for(auto trace : trace_state().thread_traces) {
         trace->pause_tracing();
     }
-    std::ostream& file = g_trace_state.file();
+    std::ostream& file = trace_state().file();
     std::stringstream procmaps;
     get_procmaps(procmaps);
     write_procmaps(file, procmaps);
@@ -489,14 +554,14 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     //
     //(we didn't mind briefly allocating procmaps because it's very little data)
     std::vector<event_buffer> traces;
-    for(auto trace : g_trace_state.thread_traces) {
+    for(auto trace : trace_state().thread_traces) {
         trace->update_name();
         traces.push_back(event_buffer{trace->buf, trace->buf_size, trace->id});
     }
     write_funtrace(file);
     write_tracebufs(file, traces);
 
-    for(auto trace : g_trace_state.thread_traces) {
+    for(auto trace : trace_state().thread_traces) {
         trace->resume_tracing();
     }
 
@@ -519,18 +584,18 @@ struct funtrace_snapshot
 
 funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
 {
-    std::lock_guard<std::mutex> guard(g_trace_state.mutex);
-    for(auto trace : g_trace_state.thread_traces) {
+    std::lock_guard<std::mutex> guard(trace_state().mutex);
+    for(auto trace : trace_state().thread_traces) {
         trace->pause_tracing();
     }
     funtrace_snapshot* snapshot = new funtrace_snapshot;
-    for(auto trace : g_trace_state.thread_traces) {
+    for(auto trace : trace_state().thread_traces) {
         trace_entry* copy = (trace_entry*)new char[trace->buf_size];
         memcpy(copy, trace->buf, trace->buf_size);
         trace->update_name();
         snapshot->thread_traces.push_back(event_buffer{copy, trace->buf_size, trace->id});
     }
-    for(auto trace : g_trace_state.thread_traces) {
+    for(auto trace : trace_state().thread_traces) {
         trace->resume_tracing();
     }
     ftrace_events_snapshot(snapshot->ftrace_events);
@@ -599,13 +664,13 @@ static trace_entry* NOINSTR find_earliest_event_after(trace_entry* begin, trace_
 
 extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time)
 {
-    std::lock_guard<std::mutex> guard(g_trace_state.mutex);
-    for(auto trace : g_trace_state.thread_traces) {
+    std::lock_guard<std::mutex> guard(trace_state().mutex);
+    for(auto trace : trace_state().thread_traces) {
         trace->pause_tracing();
     }
     funtrace_snapshot* snapshot = new funtrace_snapshot;
     uint64_t pause_time = funtrace_time();
-    for(auto trace : g_trace_state.thread_traces) {
+    for(auto trace : trace_state().thread_traces) {
         trace_entry* pos = trace->pos;
         trace_entry* buf = trace->buf;
         trace_entry* end = buf + trace->buf_size/sizeof(trace_entry);
@@ -626,7 +691,7 @@ extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_sta
         trace->update_name();
         snapshot->thread_traces.push_back(event_buffer{copy, entries*sizeof(trace_entry), trace->id});
     }
-    for(auto trace : g_trace_state.thread_traces) {
+    for(auto trace : trace_state().thread_traces) {
         trace->resume_tracing();
     }
     ftrace_events_snapshot(snapshot->ftrace_events, time);
@@ -641,23 +706,21 @@ extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_up_
 
 extern "C" void NOINSTR funtrace_ignore_this_thread()
 {
-    g_trace_state.unregister_this_thread();
-    g_thread_trace.free();
+    trace_state().unregister_this_thread();
 }
 
 extern "C" void NOINSTR funtrace_set_thread_log_buf_size(int log_buf_size)
 {
     funtrace_ignore_this_thread();
     if(log_buf_size >= 5) { //5 is log(sizeof(trace_entry)*2
-        g_thread_trace.allocate(log_buf_size);
-        g_trace_state.register_this_thread();
+        trace_state().register_this_thread(log_buf_size);
     }
 }
 
 extern "C" void NOINSTR funtrace_disable_tracing()
 {
-    std::lock_guard<std::mutex> guard(g_trace_state.mutex);
-    for(auto trace : g_trace_state.thread_traces) {
+    std::lock_guard<std::mutex> guard(trace_state().mutex);
+    for(auto trace : trace_state().thread_traces) {
         trace->pause_tracing();
     }
 }
@@ -665,8 +728,8 @@ extern "C" void NOINSTR funtrace_disable_tracing()
 
 extern "C" void NOINSTR funtrace_enable_tracing()
 {
-    std::lock_guard<std::mutex> guard(g_trace_state.mutex);
-    for(auto trace : g_trace_state.thread_traces) {
+    std::lock_guard<std::mutex> guard(trace_state().mutex);
+    for(auto trace : trace_state().thread_traces) {
         trace->resume_tracing();
     }
 }
@@ -674,7 +737,7 @@ extern "C" void NOINSTR funtrace_enable_tracing()
 // we interpose pthread_create in order to implement the thing that having
 // a ctor & dtor for the trace_data struct would do, but more efficiently.
 //
-// we need a thread's thread_local trace_data to be added to g_trace_state.thread_traces
+// we need a thread's thread_local trace_data to be added to trace_state().thread_traces
 // set when a new thread is created, and we need it to be removed from this set
 // when it is destroyed. a ctor & dtor would do it but the ctor slows down the trace()
 // function which would need to check every time if the thread_local object was
@@ -694,15 +757,13 @@ struct pthread_args
 
 void* NOINSTR pthread_entry_point(void* arg)
 {
-    g_thread_trace.allocate();
-    g_trace_state.register_this_thread();
+    trace_state().register_this_thread();
 
     pthread_args* args = (pthread_args*)arg;
     void* ret = args->func(args->arg);
     delete args;
 
-    g_trace_state.unregister_this_thread();
-    g_thread_trace.free();
+    trace_state().unregister_this_thread(true); //defer freeing if configured to garbage-collect
 
     return ret;
 }
@@ -732,17 +793,8 @@ int NOINSTR pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 //need a dtor - the main thread never "goes out of scope" until the program terminates
 struct register_main_thread
 {
-    NOINSTR register_main_thread()
-    {
-        g_thread_trace.allocate();
-        g_trace_state.register_this_thread();
-    }
-
-    NOINSTR ~register_main_thread()
-    {
-        g_trace_state.unregister_this_thread();
-        g_thread_trace.free();
-    }
+    NOINSTR register_main_thread() { trace_state().register_this_thread(); }
+    NOINSTR ~register_main_thread() { trace_state().unregister_this_thread(); }
 }
 g_funtrace_register_main_thread;
 
@@ -818,16 +870,18 @@ __cxa_throw(void* thrown_object, std::type_info* type_info, void (_GLIBCXX_CDTOR
     real_cxa_throw(thrown_object, type_info, dest);
 }
 
+#include <thread>
+#include <atomic>
+#include <csignal>
+#include <condition_variable>
+#include <chrono>
+
 //we register a signal handler for SIGTRAP, and have a thread waiting for the signal
 //to arrive and dumping trace data when it does. this is good for programs you don't
 //want to modify beyond rebuilding (otherwise it's not so great since you can't time
 //the event very well, but it might still be enough to get a feeling of what the program
 //is doing)
 #ifndef FUNTRACE_NO_SIGTRAP
-
-#include <thread>
-#include <atomic>
-#include <csignal>
 
 struct sigtrap_handler
 {
@@ -874,6 +928,59 @@ void NOINSTR sigtrap_handler::thread_func()
 }
 
 #endif //FUNTRACE_NO_SIGTRAP
+
+//if FUNTRACE_GC_MAX_AGE_MS is defined to zero, we don't spawn a GC thread at all.
+//otherwise we allow to reconfigure the GC waiting period using an env var
+#if FUNTRACE_GC_MAX_AGE_MS > 0
+
+struct funtrace_gc
+{
+    std::mutex mutex;
+    std::condition_variable cond_var;
+    std::thread thread;
+    int gc_period_ms;
+
+    NOINSTR funtrace_gc()
+    {
+        gc_period_ms = env_int("FUNTRACE_GC_PERIOD_MS", FUNTRACE_GC_PERIOD_MS);
+        if(gc_period_ms == 0) {
+            return;
+        }
+        thread = std::thread([this] {
+            thread_func();
+        });
+    }
+    NOINSTR ~funtrace_gc()
+    {
+        if(gc_period_ms == 0) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            cond_var.notify_one();
+        }
+        thread.join();
+    }
+    void NOINSTR thread_func();
+}
+g_funtrace_gc;
+
+void NOINSTR funtrace_gc::thread_func()
+{
+    funtrace_ignore_this_thread();
+    pthread_setname_np(pthread_self(), "funtrace_gc");
+    while(true) {
+        std::unique_lock<std::mutex> lock(mutex);
+        auto reason = cond_var.wait_for(lock, std::chrono::milliseconds(gc_period_ms));
+        bool exiting = reason != std::cv_status::timeout;
+        trace_state().collect_garbage(exiting);
+        if(exiting) {
+            break;
+        }
+    }
+}
+
+#endif
 
 #ifndef FUNTRACE_NO_FTRACE
 

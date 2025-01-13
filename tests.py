@@ -153,6 +153,11 @@ def orphans_ref(json):
         (ret,'orphan_call_1'),
     ]
 
+buf_size_ref = [
+    (call,'f'),
+    (ret,'f'),
+]
+
 class funinfo:
     def __init__(self,line,t):
         self.line = line
@@ -259,7 +264,7 @@ def run_cxx_test(test, binaries):
             env = 'env XRAY_OPTIONS="patch_premain=true"' 
         cmds = [
             f'mkdir -p {OUTDIR}/{name}',
-            f'cd {OUTDIR}/{name}; {env} ../../{binary} | tee stdout',
+            f'cd {OUTDIR}/{name}; {env} ../../{binary}',
         ]
         if 'count' in test:
             cmds += [
@@ -292,6 +297,7 @@ def main():
     buildcmds('longjmp.cpp')
     buildcmds('tailcall.cpp')
     buildcmds('orphans.cpp')
+    buildcmds('buf_size.cpp')
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)
 
@@ -302,22 +308,30 @@ def main():
 
     print('checking results...')
 
+    def load_threads(json):
+        return parse_perfetto_json(json)['threads']
     def load_thread(json):
-        return list(parse_perfetto_json(json)['threads'].values())[0]
+        return list(load_threads(json).values())[0]
 
-    def jsons(test): return sorted(glob.glob(f'./{OUTDIR}/{test}.*/funtrace.json'))
+    def jsons(test): return sorted(glob.glob(f'{OUTDIR}/{test}.*/funtrace.json'))
 
     for json in jsons('exceptions'):
         print('checking',json)
-        assert verify_thread(load_thread(json), exceptions_ref)
+        verify_thread(load_thread(json), exceptions_ref)
     for json in jsons('longjmp'): 
         print('checking',json)
         assert verify_thread(load_thread(json), longjmp_ref)
     for json in jsons('orphans'): 
         print('checking',json)
         assert verify_thread(load_thread(json), orphans_ref(json))
+    for json in jsons('buf_size'): 
+        print('checking',json)
+        threads = load_threads(json)
+        assert verify_thread(threads['event_buf_1'], buf_size_ref)
+        num_f_calls = len([name for _,name,_ in threads['event_buf_16'] if name.startswith('f()')])
+        assert num_f_calls <= 16*2 and num_f_calls >= 14*2, f'wrong number of f calls: {num_f_calls}'
 
-    for symcount_txt in sorted(glob.glob(f'./{OUTDIR}/count.*/symcount.txt')):
+    for symcount_txt in sorted(glob.glob(f'{OUTDIR}/count.*/symcount.txt')):
         print('checking',symcount_txt)
         check_count_results(symcount_txt)
 

@@ -17,5 +17,6 @@ struct scope_tracer
     {
         funtrace_snapshot* snapshot = funtrace_pause_and_get_snapshot_starting_at_time(start_time);
         funtrace_write_snapshot(fname, snapshot);
+        funtrace_free_snapshot(snapshot);
     };
 };
