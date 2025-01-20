@@ -158,6 +158,11 @@ buf_size_ref = [
     (ret,'f'),
 ]
 
+freq_ref = [
+    (call,'usleep_1500'),
+    (ret,'usleep_1500'),
+]
+
 class funinfo:
     def __init__(self,line,t):
         self.line = line
@@ -299,6 +304,7 @@ def main():
     buildcmds('orphans.cpp')
     buildcmds('buf_size.cpp')
     buildcmds('benchmark.cpp')
+    buildcmds('freq.cpp')
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)
 
@@ -335,6 +341,15 @@ def main():
     for symcount_txt in sorted(glob.glob(f'{OUTDIR}/count.*/symcount.txt')):
         print('checking',symcount_txt)
         check_count_results(symcount_txt)
+
+    # check last... might fail intermittently because we sleep for more than we asked for
+    # due to the machine being loaded or whatever
+    for json in jsons('freq'):
+        print('checking',json)
+        t = load_thread(json)
+        assert verify_thread(t, freq_ref)
+        slept = t[1][-1]-t[0][-1]
+        assert slept >= 1500 and slept < 1700, f'wrong sleeping time {slept}'
 
 if __name__ == '__main__':
     main()

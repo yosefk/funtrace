@@ -60,7 +60,7 @@ uint64_t funtrace_ticks_per_second(); /* funtrace_time()/funtrace_ticks_per_seco
 
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time);
 struct funtrace_snapshot* funtrace_pause_and_get_snapshot_up_to_age(uint64_t max_event_age);
-void funtrace_free_snapshot(struct funtrace_snapshot* snapshot);
+void funtrace_free_snapshot(struct funtrace_snapshot* snapshot); /* nop if NULL is passed */
 
 /* writing out a sample into its own file after it was obtained with funtrace_pause_and_get_snapshot()
    does not interfere with threads starting and terminating. TODO: we could add a version with

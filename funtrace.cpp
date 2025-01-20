@@ -611,6 +611,9 @@ funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
 
 extern "C" void NOINSTR funtrace_free_snapshot(funtrace_snapshot* snapshot)
 {
+    if(!snapshot) {
+        return;
+    }
     for(auto trace : snapshot->thread_traces) {
         delete [] (char*)trace.buf;
     }
@@ -989,7 +992,7 @@ void NOINSTR funtrace_gc::thread_func()
 
 #endif
 
-#ifndef FUNTRACE_NO_FTRACE
+#if FUNTRACE_FTRACE_EVENTS_IN_BUF > 0
 
 struct ftrace_event
 {
@@ -1008,11 +1011,17 @@ struct ftrace_handler
     bool init_errors = false;
     std::vector<ftrace_event> events; //cyclic buffer
     int pos = 0;
+    bool started = false;
     std::atomic<bool> quit;
 
     NOINSTR ftrace_handler() {
         quit = false;
-        if(getenv("FUNTRACE_NO_FTRACE")) {
+        int events_in_buf = FUNTRACE_FTRACE_EVENTS_IN_BUF;
+        const char* env = getenv("FUNTRACE_FTRACE_EVENTS_IN_BUF");
+        if(env) {
+            events_in_buf = atoi(env);
+        }
+        if(!events_in_buf) {
             init_errors = true;
             return;
         }
@@ -1022,11 +1031,6 @@ struct ftrace_handler
             return;
         }
         mutex.lock();
-        int events_in_buf = FUNTRACE_FTRACE_EVENTS_IN_BUF;
-        const char* env = getenv("FUNTRACE_FTRACE_EVENTS_IN_BUF");
-        if(env) {
-            events_in_buf = atoi(env);
-        }
         events.resize(events_in_buf);
         thread = std::thread([this] {
             thread_func();
@@ -1036,9 +1040,12 @@ struct ftrace_handler
         mutex.unlock();
     }
     NOINSTR ~ftrace_handler() {
+        if(!started) {
+            return; //no thread spawned
+        }
+        quit = true;
         //we make sure the thread is awakened by a thread-spawning event,
         //and then wait for it to quit.
-        quit = true;
         auto dummy = std::thread([] {});
         thread.join();
         dummy.join();
@@ -1149,6 +1156,7 @@ void NOINSTR ftrace_handler::ftrace_init()
 //core dump time to save ftrace data aside
 void NOINSTR ftrace_handler::thread_func()
 {
+    started = true;
     funtrace_ignore_this_thread();
 
     pthread_setname_np(pthread_self(), "funtrace-ftrace");
@@ -1173,6 +1181,10 @@ void NOINSTR ftrace_handler::thread_func()
     }
 
     std::ifstream trace_pipe(base+"trace_pipe");
+
+    if(init_errors) {
+        quit = true; //quit immediately
+    }
 
     //signals that we started
     mutex.unlock();
@@ -1250,6 +1262,6 @@ static void NOINSTR ftrace_events_snapshot(std::vector<std::string>& snapshot, u
 {
 }
 
-#endif //FUNTRACE_NO_FTRACE
+#endif //FUNTRACE_FTRACE_EVENTS_IN_BUF > 0
 
 #endif //FUNTRACE_FUNCOUNT

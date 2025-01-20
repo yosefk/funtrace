@@ -8,7 +8,9 @@ use procaddr2sym::{ProcAddr2Sym, SymInfo};
 use serde_json::Value;
 use clap::Parser;
 use std::cmp::max;
-use num::{Rational64, FromPrimitive, Zero};
+use num::{FromPrimitive, Zero};
+use num::rational::Ratio;
+use num::bigint::BigInt;
 
 const RETURN_BIT: i32 = 63;
 const RETURN_WITH_CALLER_ADDRESS_BIT: i32 = 62;
@@ -36,7 +38,7 @@ struct SourceCode {
 #[clap(about="convert funtrace.raw to JSON files in the viztracer/vizviewer format (pip install viztracer; or use Perfetto but then you won't see source code)", version)]
 struct Cli {
     #[clap(help="funtrace.raw input file with one or more trace samples")]
-    functrace_raw: String,
+    funtrace_raw: String,
     #[clap(help="basename.json, basename.1.json, basename.2.json... are created, one JSON file per trace sample")]
     out_basename: String,
     #[clap(short, long, help="print the static addresses and executable/shared object files of decoded functions in addition to name, file & line")]
@@ -125,11 +127,17 @@ fn parse_ftrace_lines(input: &String, transform_timestamp: impl Fn(u64) -> Strin
     results
 }
 
-fn rat2dec(rational: &Rational64, decimal_places: u32) -> String {
-    // Round; we're assuming positive numbers - add 0.0..05
-    let rounded = rational + Rational64::from_u64(5).unwrap() / Rational64::from_u64(10u64.pow(decimal_places+1)).unwrap();
+fn rat2dec(rat: &Ratio<BigInt>, decimal_places: u32) -> String {
+    let mut result = "".to_string();
+    let mut rational = rat.clone();
+    if rat < &Ratio::from_u64(0).unwrap() { //shouldn't happen in this program but let's print correctly if it does
+        rational = -rat;
+        result = "-".to_string();
+    }
+    // Round - add 0.0..05
+    let rounded = rational + Ratio::from_u64(5).unwrap() / Ratio::from_u64(10u64.pow(decimal_places+1)).unwrap();
 
-    // Get numerator and denominator as BigInt
+    // Get numerator and denominator
     let numerator = rounded.numer();
     let denominator = rounded.denom();
     
@@ -138,7 +146,7 @@ fn rat2dec(rational: &Rational64, decimal_places: u32) -> String {
     let mut remainder = numerator % denominator;
     
     // Build the decimal string
-    let mut result = quotient.to_string();
+    result = result + &quotient.to_string();
     
     if !remainder.is_zero() {
         result.push('.');
@@ -213,7 +221,7 @@ impl TraceConverter {
         //using f64 would lose precision for machines with an uptime > month since f64 stores
         //52 mantissa bits and TSC increments a couple billion times per second.
         //we use rational numbers instead
-        let rat = |n: u64| Rational64::from_u64(n).unwrap();
+        let rat = |n: u64| Ratio::from_u64(n).unwrap();
         let cycles_per_us = rat(self.cpu_freq) / rat(1000000);
 
         let (extra_ret, extra_call) = if extra_ns > 0 {
@@ -234,7 +242,7 @@ impl TraceConverter {
             //(despite the beautiful gradient that orphan B events are rendered with)
             json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X","pid":{}}}"#, "\n,",
                         thread_id.tid,
-                        rat2dec(&(rat(call_cycle)/cycles_per_us.clone() - extra_call), digits),
+                        rat2dec(&(rat(call_cycle)/cycles_per_us.clone() - extra_call.clone()), digits),
                         rat2dec(&(rat(return_cycle-call_cycle)/cycles_per_us + extra_call + extra_ret), digits),
                         json_name(call_sym), thread_id.pid).as_bytes())?; 
         }    
@@ -278,12 +286,12 @@ impl TraceConverter {
         self.first_event_in_json = true;
         let mut ignore_addrs: HashSet<u64> = HashSet::new();
     
-        let rat = |n: u64| Rational64::from_u64(n).unwrap();
+        let rat = |n: u64| Ratio::from_u64(n).unwrap();
         //ftrace timestamps are supposed to be in seconds; CPU frequency is in TSC cycles per second;
         //so dividing by frequency will convert TSC to seconds. Perfetto timeline accuracy is ns
         //hence 10 digits after '.' (9 plus another to make sure different cycles don't become the same ns)
         let cycles_per_second = rat(self.cpu_freq);
-        let fixts = |ts: u64| format!("{}", rat2dec(&(rat(ts)/cycles_per_second), 10));
+        let fixts = |ts: u64| format!("{}", rat2dec(&(rat(ts)/cycles_per_second.clone()), 10));
         let mut ftrace_events = parse_ftrace_lines(ftrace_text, fixts);
 
         let oldest = self.oldest_event(sample_entries, &ftrace_events);
@@ -644,6 +652,6 @@ fn main() -> io::Result<()> {
         PRINT_BIN_INFO = args.executable_file_info;
     }
     let mut convert = TraceConverter::new(&args);
-    convert.parse_chunks(&args.functrace_raw, &args.out_basename)
+    convert.parse_chunks(&args.funtrace_raw, &args.out_basename)
 }
 
