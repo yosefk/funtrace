@@ -210,9 +210,13 @@ def system(cmd):
 
 BUILDDIR = './built-tests'
 OUTDIR = './out'
+# I distincitly remember I once used a different way to build static binaries from Rust
+# but I can't find a way like that now so even though it seems slower than glibc
+# that's what we test since it's nice to release static binaries
+TARGET = 'x86_64-unknown-linux-musl'
 
 def build_trace_analysis_tools():
-    system('cargo build -r')
+    system(f'cargo build -r --target {TARGET}')
 
 def run_cmds(cmds):
     for cmd in cmds:
@@ -273,11 +277,11 @@ def run_cxx_test(test, binaries):
         ]
         if 'count' in test:
             cmds += [
-                f'./target/release/funcount2sym {OUTDIR}/{name}/funcount.txt | c++filt > {OUTDIR}/{name}/symcount.txt'
+                f'./target/{TARGET}/release/funcount2sym {OUTDIR}/{name}/funcount.txt | c++filt > {OUTDIR}/{name}/symcount.txt'
             ]
         else:
             cmds += [
-                f'./target/release/funtrace2viz {OUTDIR}/{name}/funtrace.raw {OUTDIR}/{name}/funtrace > {OUTDIR}/{name}/f2v.out'
+                f'./target/{TARGET}/release/funtrace2viz {OUTDIR}/{name}/funtrace.raw {OUTDIR}/{name}/funtrace > {OUTDIR}/{name}/f2v.out'
             ]
         cmdlists.append(cmds)
     return cmdlists
