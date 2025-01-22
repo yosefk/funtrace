@@ -13,7 +13,7 @@ def parse_perfetto_json(fname):
     events = data['traceEvents']
     threads = {}
     thread_names = {}
-    timestamps = set()
+    timestamps = {}
     for event in events:
         phase = event['ph']
         tid = event['tid']
@@ -22,18 +22,18 @@ def parse_perfetto_json(fname):
             if name == 'thread_name':
                 thread_names[tid] = event['args']['name']
             continue
+        assert phase == 'X' # complete event
         timepoints = threads.setdefault(thread_names[tid], list())
         timestamp = event['ts']
+        duration = event['dur']
 
-        assert timestamp not in timestamps, 'expecting unique timestamps in every thread!'
-        timestamps.add(timestamp)
+        assert timestamp not in timestamps, f'expecting unique timestamps in every thread! 2 events with the same timestamp: call of {event}; {timestamps[timestamp]}'
+        assert timestamp+duration not in timestamps, f'expecting unique timestamps in every thread! 2 events with the same timestamp: return of {event}; {timestamps[timestamp+duration]}'
+        timestamps[timestamp] = ('call',event)
+        timestamps[timestamp+duration] = ('ret',event)
 
-        if phase == 'B': # begin timepoint
-            timepoints.append((call, name, timestamp))
-        elif phase == 'X': # complete event
-            duration = event['dur']
-            timepoints.append((call, name, timestamp))
-            timepoints.append((ret, name, timestamp+duration))
+        timepoints.append((call, name, timestamp))
+        timepoints.append((ret, name, timestamp+duration))
 
     # sort by the timestamp
     for timepoints in threads.values():
@@ -84,6 +84,7 @@ def verify_thread(timepoints, ref_calls_and_returns):
     return ok
 
 exceptions_ref = [
+    (call,'caller'),
     (call,'catcher'),
     (call,'before_try'),
     (ret,'before_try'),
@@ -107,7 +108,72 @@ exceptions_ref = [
     (call,'__cxa_end_catch'),
     (ret,'__cxa_end_catch'),
     (ret,'catcher'),
+    (ret,'caller'),
 ]*3
+
+# the "clean" case [supplied by gcc -finstrument-functions] is for the untraced
+# catcher to simply disappear from the trace but without any other artifacts
+clean_untraced_caller_ref = [(evt,func) for evt,func in exceptions_ref if func!='catcher']
+
+unfortunate_full_unwinding = [
+    (call,'caller'),
+    (call,'before_try'),
+    (ret,'before_try'),
+    (call,'wrapper_call_outer'),
+    (call,'wrapper_tailcall_2'),
+    (call,'wrapper_tailcall_1'),
+    (call,'wrapper_call'),
+    (call,'thrower'),
+    (call,'__cxa_throw'),
+    (ret,'__cxa_throw'),
+    (ret,'thrower'), # throw going to the catch block should be decoded as all the
+    # unwound functions returning
+    (ret,'wrapper_call'),
+    (ret,'wrapper_tailcall_1'),
+    (ret,'wrapper_tailcall_2'),
+    (ret,'wrapper_call_outer'),
+    (ret,'caller'),
+    (call,'__cxa_begin_catch'),
+    (ret,'__cxa_begin_catch'),
+    (call,'after_catch'),
+    (ret,'after_catch'),
+    (call,'__cxa_end_catch'),
+    (ret,'__cxa_end_catch'),
+]
+
+def caller_wrapping(events): return [(call,'caller')] + events + [(ret,'caller')]
+def catcher_wrapping(events): return [(call,'catcher')] + events + [(ret,'catcher')]
+
+# in the "dirty" untraced caller case, we have 2 artifacts:
+# 1. the call stack is fully unwound since we don't know where to stop (the catcher's call event wasn't traced;
+#    so for all we know the catcher was the outermost caller)
+# 2. when the caller of the catcher returns, it is treated as an "orphan return" and we get the "illusion"
+#    that the caller was called more than it actually was since we make up a call event for the orphan return
+#    (this artifact could be avoided in most cases by doing more work in the tracer but it wouldn't
+#    solve the 1st artifact, definitely not when the return from the caller was never logged, eg because it didn't happen
+#    by the time the snapshot was taken)
+dirty_untraced_caller_ref = caller_wrapping(caller_wrapping(caller_wrapping(unfortunate_full_unwinding) + unfortunate_full_unwinding) + unfortunate_full_unwinding)
+# with XRay, the catcher is the one for which we see "orphan returns" after unwinding [due to XRay's funky return address logging]
+dirty_untraced_catcher_xray_ref = catcher_wrapping(catcher_wrapping(catcher_wrapping(unfortunate_full_unwinding) + unfortunate_full_unwinding) + unfortunate_full_unwinding)
+
+# test that the traced funcs were actually traced and that untraced ones weren't.
+# if potentially non-trivial, it's mainly for XRay with its return address logging
+untraced_funcs_ref = [
+    (call, 'tr2'),
+    (call, 'tr1'),
+    (ret, 'tr1'),
+    (ret, 'tr2'),
+    (call, 'tr1'),
+    (ret, 'tr1'),
+    (call, 'tr4'),
+    (call, 'tr3'),
+    (ret, 'tr3'),
+    (ret, 'tr4'),
+    (call, 'tr4'),
+    (call, 'tr3'),
+    (ret, 'tr3'),
+    (ret, 'tr4'),
+]
 
 longjmp_ref = [
     (call,'setter'),
@@ -303,6 +369,8 @@ def main():
         test2bins.update(b)
 
     buildcmds('exceptions.cpp')
+    buildcmds('untraced_catcher.cpp')
+    buildcmds('untraced_funcs.cpp')
     buildcmds('longjmp.cpp')
     buildcmds('tailcall.cpp')
     buildcmds('orphans.cpp')
@@ -328,7 +396,14 @@ def main():
 
     for json in jsons('exceptions'):
         print('checking',json)
-        verify_thread(load_thread(json), exceptions_ref)
+        assert verify_thread(load_thread(json), exceptions_ref)
+    for json in jsons('untraced_catcher'):
+        print('checking',json)
+        ref = clean_untraced_caller_ref if 'fi-gcc' in json else (dirty_untraced_caller_ref if 'xray' not in json else dirty_untraced_catcher_xray_ref)
+        assert verify_thread(load_thread(json), ref)
+    for json in jsons('untraced_funcs'): 
+        print('checking',json)
+        assert verify_thread(load_thread(json), untraced_funcs_ref)
     for json in jsons('longjmp'): 
         print('checking',json)
         assert verify_thread(load_thread(json), longjmp_ref)

@@ -50,7 +50,13 @@ void NI after_catch()
     n++;
 }
 
-void NI catcher()
+#ifndef UNTRACED_CATCHER
+#define TRACE
+#else
+#define TRACE NOFUNTRACE
+#endif
+
+void NI TRACE catcher()
 {
     n++;
     before_try();
@@ -63,10 +69,17 @@ void NI catcher()
     n++;
 }
 
+void NI caller()
+{
+    n++;
+    catcher();
+    n++;
+}
+
 int main()
 {
     scope_tracer tracer;
     for(int i=0; i<3; ++i) {
-        catcher();
+        caller();
     }
 }

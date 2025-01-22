@@ -200,7 +200,13 @@ inline void NOINSTR trace_data::trace(void* ptr, uint64_t flags)
 
 thread_local trace_data g_thread_trace;
 
-extern "C" void NOINSTR __cyg_profile_func_enter(void* func, void*) { g_thread_trace.trace(func, 0); }
+#if (defined __GNUC__) && !(defined __clang__)
+#define CALL_FLAGS (1ULL<<FUNTRACE_CALL_RETURNING_UPON_THROW_BIT)
+#else
+#define CALL_FLAGS 0
+#endif
+
+extern "C" void NOINSTR __cyg_profile_func_enter(void* func, void*) { g_thread_trace.trace(func, CALL_FLAGS); }
 extern "C" void NOINSTR __cyg_profile_func_exit(void* func, void*) { g_thread_trace.trace(func, 1ULL<<FUNTRACE_RETURN_BIT); }
 
 //funtrace_pg.S is based on assembly generated from these C functions, massaged

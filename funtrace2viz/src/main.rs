@@ -15,7 +15,8 @@ use num::bigint::BigInt;
 const RETURN_BIT: i32 = 63;
 const RETURN_WITH_CALLER_ADDRESS_BIT: i32 = 62;
 const CATCH_MASK: u64 = (1<<RETURN_BIT)|(1<<RETURN_WITH_CALLER_ADDRESS_BIT);
-const ADDRESS_MASK: u64 = !CATCH_MASK;
+const CALL_RETURNING_UPON_THROW_BIT: i32 = 61;
+const ADDRESS_MASK: u64 = !(CATCH_MASK | (1<<CALL_RETURNING_UPON_THROW_BIT));
 const MAGIC_LEN: usize = 8;
 const LENGTH_LEN: usize = 8;
 
@@ -344,11 +345,29 @@ impl TraceConverter {
                     //will cause us to pop everything from the stack. but resetting the stack upon a catch
                     //is probably less bad than leaving it as is since then it would keep growing with
                     //every catch
+                    //
+                    //TODO: we could probably improve the handling of "uninstrumented catchers" by keeping
+                    //a history of the fully-popped stacks and then when a return arrives of a function
+                    //in one of these stacks that was "orphaned" by the throw/catch, we could find its call
+                    //entry in this history and reconstruct the call sequence. this could be done given demand;
+                    //ATM we just advise against compiling "catchers" without instrumentation. [note that
+                    //the improvement above would work some of the time but not always, eg because a return
+                    //of any of the catcher's caller wasn't traced, either because it didn't happen or
+                    //because the callers of the catcher were also uninstrumented - and this isn't a far-fetched
+                    //scenario, eg if you have some loop with the top-level code catching exceptions,
+                    //it might be running "indefinitely" so you won't see a return that would trigger the
+                    //logic above. so advising against uninstrumented catchers
+                    //will remain valid even if we add all the logic described above.]
                     let catcher = self.sym_cache.get(&addr).unwrap().demangled_func.clone();
                     let mut unwound = 0;
                     while !stack.is_empty() {
                         let last = stack.last().unwrap();
-                        let call_sym = self.sym_cache.get(&last.address).unwrap();
+                        if bit_set(last.address, CALL_RETURNING_UPON_THROW_BIT) {
+                            //this was traced with -finstrument-functions or "something" that would have
+                            //recorded a return event had it been returned from due to stack unwinding
+                            break;
+                        }
+                        let call_sym = self.sym_cache.get(&(last.address & ADDRESS_MASK)).unwrap();
                         if catcher == call_sym.demangled_func { //we don't compare by address since it could be two
                             //different symbols - we entered "f(int)" and we are catching inside "f(int) [clone .cold]";
                             //procaddr2sym strips the [clone...] from the name so we can compare by it
@@ -356,9 +375,9 @@ impl TraceConverter {
                         }
                         //these all end at the same cycle contrary to the JSON spec's perfect nesting requirement;
                         //unlike XRay we try to make them stand apart by 1 ns (the timeline's precision), also makes testing more straightforward
+                        unwound += 1;
                         self.write_function_call_event(&mut json, &call_sym.clone(), last.cycle, entry.cycle, unwound, &thread_trace.thread_id, &mut funcset)?;
                         stack.pop();
-                        unwound += 1;
                     }
                     continue;
                 }
@@ -407,7 +426,7 @@ impl TraceConverter {
                                     break;
                                 }
                                 let last = stack.last().unwrap();
-                                call_sym = self.sym_cache.get(&last.address).unwrap().clone();
+                                call_sym = self.sym_cache.get(&(last.address & ADDRESS_MASK)).unwrap().clone();
                                 call_cycle = last.cycle;
                                 println!("        WARNING: popping {}", json_name(&call_sym));
                                 stack.pop();
@@ -417,8 +436,8 @@ impl TraceConverter {
                         }
                     }
                     else if !stack.is_empty() {
-                        let ret_caller_sym = self.sym_cache.get(&stack.last().unwrap().address).unwrap();
-                        if ret_sym.demangled_func != ret_caller_sym.demangled_func {
+                        let ret_caller_sym = self.sym_cache.get(&(stack.last().unwrap().address & ADDRESS_MASK)).unwrap();
+                        if ret_sym.demangled_func != ret_caller_sym.demangled_func && stack.iter().any(|&entry| self.sym_cache.get(&(entry.address & ADDRESS_MASK)).unwrap().demangled_func == ret_sym.demangled_func) {
                             println!("      WARNING: call/return mismatch - {} called from {}, the returning function's caller is {}", json_name(&call_sym), json_name(ret_caller_sym), json_name(&ret_sym));
                             let mut found = false;
                             while !found {
@@ -427,12 +446,12 @@ impl TraceConverter {
                                     break;
                                 }
                                 let last = stack.last().unwrap();
-                                call_sym = self.sym_cache.get(&last.address).unwrap().clone();
+                                call_sym = self.sym_cache.get(&(last.address & ADDRESS_MASK)).unwrap().clone();
                                 call_cycle = last.cycle;
                                 println!("        WARNING: popping {}", json_name(&call_sym));
                                 stack.pop();
                                 returns += 1;
-                                found = !stack.is_empty() && ret_sym.demangled_func == self.sym_cache.get(&stack.last().unwrap().address).unwrap().demangled_func;
+                                found = !stack.is_empty() && ret_sym.demangled_func == self.sym_cache.get(&(stack.last().unwrap().address & ADDRESS_MASK)).unwrap().demangled_func;
                             }
                         }
                     }
@@ -442,7 +461,7 @@ impl TraceConverter {
             //if the stack isn't empty, record a call with a fake return cycle
             let mut fake_returns = stack.len() as i32;
             for entry in &stack {
-                 let call_sym = self.sym_cache.get(&entry.address).unwrap();
+                 let call_sym = self.sym_cache.get(&(entry.address & ADDRESS_MASK)).unwrap();
                  self.write_function_call_event(&mut json, &call_sym.clone(), entry.cycle, latest_cycle, fake_returns, &thread_trace.thread_id, &mut funcset)?;
                  fake_returns -= 1;
             }
