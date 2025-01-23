@@ -970,6 +970,7 @@ struct funtrace_gc
     std::condition_variable cond_var;
     std::thread thread;
     int gc_period_ms;
+    std::atomic<bool> quit;
     std::atomic<bool> done;
 
     NOINSTR funtrace_gc()
@@ -978,6 +979,7 @@ struct funtrace_gc
         if(gc_period_ms == 0) {
             return;
         }
+        quit = false;
         done = false;
         thread = std::thread([this] {
             thread_func();
@@ -988,7 +990,8 @@ struct funtrace_gc
         if(gc_period_ms == 0) {
             return;
         }
-        while(!done) {
+        quit = true;
+        {
             std::lock_guard<std::mutex> guard(mutex);
             cond_var.notify_one();
         }
@@ -1005,7 +1008,7 @@ void NOINSTR funtrace_gc::thread_func()
     while(true) {
         std::unique_lock<std::mutex> lock(mutex);
         auto reason = cond_var.wait_for(lock, std::chrono::milliseconds(gc_period_ms));
-        bool exiting = reason != std::cv_status::timeout;
+        bool exiting = reason != std::cv_status::timeout || quit;
         trace_state().collect_garbage(exiting);
         if(exiting) {
             break;
