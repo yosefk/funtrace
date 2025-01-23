@@ -397,6 +397,7 @@ def main():
     buildcmds('benchmark.cpp')
     buildcmds('freq.cpp')
     buildcmds('killed.cpp')
+    buildcmds('sigtrap.cpp')
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)
 
@@ -422,6 +423,7 @@ def check():
 
     def jsons(test): return sorted(glob.glob(f'{OUTDIR}/{test}.*/funtrace.json'))
 
+    # funtrace tests [except freq]
     for json in jsons('ignore_disable'):
         print('checking',json)
         threads = load_threads(json)
@@ -455,7 +457,12 @@ def check():
         assert verify_thread(threads['event_buf_1'], buf_size_ref)
         num_f_calls = len([name for _,name,_ in threads['event_buf_16'] if name.startswith('f()')])
         assert num_f_calls <= 16*2 and num_f_calls >= 14*2, f'wrong number of f calls: {num_f_calls}'
+    for json in jsons('sigtrap'):
+        print('checking',json)
+        thread = load_thread(json)
+        assert len([name for _,name,_ in thread if name.startswith('traced_func')]) >= 100
 
+    # funcount test
     for symcount_txt in sorted(glob.glob(f'{OUTDIR}/count.*/symcount.txt')):
         print('checking',symcount_txt)
         check_count_results(symcount_txt)
