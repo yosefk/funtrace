@@ -2,6 +2,10 @@
 
 volatile int shared_n;
 
+//we want the libraries to be loaded far apart to make sure
+//funcount actually finds the newly mapped executable segments
+//as opposed to "being lucky" with them mapped where it already
+//has pages in its page table
 char buf[256*1024]={1};
 
 struct glob

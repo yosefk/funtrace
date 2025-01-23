@@ -18,11 +18,13 @@ def parse_perfetto_json(fname):
         phase = event['ph']
         tid = event['tid']
         name = event['name']
-        if 'std::thread::_Invoker' in name: # we use std::thread in tests - ignore the noise it adds to traces
+        if 'std::thread::_Invoker' in name or 'std::thread::thread' in name: # we use std::thread in tests - ignore the noise it adds to traces
             continue # 
         if phase == 'M': # metadata
             if name == 'thread_name':
                 thread_names[tid] = event['args']['name']
+                if thread_names[tid] in threads: # not a unique name
+                    thread_names[tid] += '.%d'%tid # mangle by tid
             continue
         assert phase == 'X' # complete event
         timepoints = threads.setdefault(thread_names[tid], list())
@@ -84,6 +86,9 @@ def verify_thread(timepoints, ref_calls_and_returns):
         print('found:')
         print_thread(timepoints,errline)
     return ok
+
+def fn(name, inner=[]):
+    return [(call,name)] + inner + [(ret,name)]
 
 # check that the ignored threads as well as the part running when tracing was
 # disabled and before it was enabled again weren't traced. there should be 2 children threads
@@ -240,6 +245,12 @@ buf_size_ref = [
     (call,'f'),
     (ret,'f'),
 ]
+
+shared_ref = fn('loop',
+    (fn('h', fn('g',fn('f')*2)+fn('f'))+
+    fn('h_shared', fn('g_shared',fn('f_shared')*2)+fn('f_shared'))+
+    fn('h_dyn_shared_c', fn('h_dyn_shared', fn('g_dyn_shared',fn('f_dyn_shared')*2)+fn('f_dyn_shared'))))*3
+)
 
 freq_ref = [
     (call,'usleep_1500'),
@@ -398,6 +409,7 @@ def main():
     buildcmds('freq.cpp')
     buildcmds('killed.cpp')
     buildcmds('sigtrap.cpp')
+    buildcmds('shared.cpp',shared=['lib_shared.cpp'],dyn_shared=['lib_dyn_shared.cpp'])
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)
 
@@ -461,6 +473,10 @@ def check():
         print('checking',json)
         thread = load_thread(json)
         assert len([name for _,name,_ in thread if name.startswith('traced_func')]) >= 100
+    for json in jsons('shared'):
+        print('checking',json)
+        for thread in load_threads(json).values():
+            assert verify_thread(thread, shared_ref)
 
     # funcount test
     for symcount_txt in sorted(glob.glob(f'{OUTDIR}/count.*/symcount.txt')):

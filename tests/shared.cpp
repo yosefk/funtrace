@@ -18,6 +18,7 @@ void NI g()
     f();
     n++;
     f();
+    n++;
 }
 
 void NI h()
@@ -25,37 +26,35 @@ void NI h()
     g();
     n++;
     f();
+    n++;
 }
 
 void h_shared();
 void (*h_shared_2)();
 
-const int64_t iters = 1000;
+const int64_t iters = 3;
 
-void loop()
+void NI loop()
 {
     for(int64_t i=0; i<iters; ++i) {
         h();
+        n++;
         h_shared();
+        n++;
         h_shared_2();
+        n++;
     }
 }
 
 int main()
 {
-    scope_tracer tracer; //we won't actually get a trace but this tests
-    //that the program will link with the funcount runtime when using
-    //funtrace APIs, though these won't do anything in the funcount build
+    scope_tracer tracer;
 
     void* lib = dlopen(LIBS, RTLD_NOW);
     h_shared_2 = (void (*)())dlsym(lib, "h_dyn_shared_c");
 
-    std::thread t([] {
-        loop();
-    });
-    std::thread t2([] {
-        loop();
-    });
+    std::thread t(loop);
+    std::thread t2(loop);
     loop();
     t.join();
     t2.join();

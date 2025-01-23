@@ -1,3 +1,5 @@
+#pragma once
+
 #include "funtrace.h"
 
 #define NI __attribute__((noinline))
