@@ -18,6 +18,8 @@ def parse_perfetto_json(fname):
         phase = event['ph']
         tid = event['tid']
         name = event['name']
+        if 'std::thread::_Invoker' in name: # we use std::thread in tests - ignore the noise it adds to traces
+            continue # 
         if phase == 'M': # metadata
             if name == 'thread_name':
                 thread_names[tid] = event['args']['name']
@@ -82,6 +84,21 @@ def verify_thread(timepoints, ref_calls_and_returns):
         print('found:')
         print_thread(timepoints,errline)
     return ok
+
+# check that the ignored threads as well as the part running when tracing was
+# disabled and before it was enabled again weren't traced. there should be 2 children threads
+ignore_disable_main_ref = [
+    (call,'run_threads'),
+    (call,'should_be_traced'),
+    (ret,'should_be_traced'),
+    (ret,'run_threads'),
+]*2
+ignore_disable_child_ref = [
+    (call,'traced_thread'),
+    (call,'should_be_traced'),
+    (ret,'should_be_traced'),
+    (ret,'traced_thread'),
+]
 
 exceptions_ref = [
     (call,'caller'),
@@ -272,7 +289,8 @@ def check_count_results(symcount_txt):
 def system(cmd):
     print('running',cmd)
     status = os.system(cmd)
-    assert status==0, f'`{cmd}` failed with status {status}'
+    if 'killed' not in cmd: # we have a test that kills itself with SIGKILL - other than that commands shouldn't fail
+        assert status==0, f'`{cmd}` failed with status {status}'
 
 BUILDDIR = './built-tests'
 OUTDIR = './out'
@@ -368,6 +386,7 @@ def main():
         cmdlists.extend(c)
         test2bins.update(b)
 
+    buildcmds('ignore_disable.cpp')
     buildcmds('exceptions.cpp')
     buildcmds('untraced_catcher.cpp')
     buildcmds('untraced_funcs.cpp')
@@ -377,14 +396,23 @@ def main():
     buildcmds('buf_size.cpp')
     buildcmds('benchmark.cpp')
     buildcmds('freq.cpp')
+    buildcmds('killed.cpp')
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)
 
     cmdlists = []
+    killedcmds = []
     for test,binaries in test2bins.items():
-        cmdlists.extend(run_cxx_test(test,binaries))
-    pool.map(run_cmds, cmdlists)
+        cmds = killedcmds if 'killed' in test else cmdlists # we run killed later
+        cmds.extend(run_cxx_test(test,binaries))
 
+    pool.map(run_cmds, cmdlists)
+    check()
+
+    pool.map(run_cmds, killedcmds)
+    check_orphan_tracer_removal()
+
+def check():
     print('checking results...')
 
     def load_threads(json):
@@ -394,6 +422,17 @@ def main():
 
     def jsons(test): return sorted(glob.glob(f'{OUTDIR}/{test}.*/funtrace.json'))
 
+    for json in jsons('ignore_disable'):
+        print('checking',json)
+        threads = load_threads(json)
+        assert len(threads) == 3
+        for name,thread in threads.items():
+            if name in ['child1','child3']:
+                assert verify_thread(thread, ignore_disable_child_ref)
+            elif name == 'main':
+                assert verify_thread(thread, ignore_disable_main_ref)
+            else:
+                assert False, f'unexpected thread name: {name}'
     for json in jsons('exceptions'):
         print('checking',json)
         assert verify_thread(load_thread(json), exceptions_ref)
@@ -429,6 +468,30 @@ def main():
         assert verify_thread(t, freq_ref)
         slept = t[1][-1]-t[0][-1]
         assert slept >= 1500 and slept < 1700, f'wrong sleeping time {slept}'
+
+def check_orphan_tracer_removal():
+    def funtrace_pid(s):
+        try:
+            t = s.split('.')
+            assert len(t) == 2 and t[0]=='funtrace'
+            return int(t[1])
+        except:
+            return 0
+    def find_tracers():
+        return [f for f in glob.glob('/sys/kernel/tracing/instances/funtrace.*') if funtrace_pid(os.path.basename(f))]
+    tracers = find_tracers()
+    assert len(tracers) >= 4, f'expected at least 4 funtrace ftrace instances, found {len(tracers)}: {tracers}'
+    print('\n'.join(['orphan tracer instances:']+tracers))
+
+    # could be any funtrace-instrumented program - they clean orphan tracer dirs upon exit
+    system(f'{BUILDDIR}/benchmark.pg')
+    for t in tracers:       
+        pid = funtrace_pid(os.path.basename(t))
+        # either the PID exists or the tracer was removed by the run of benchmark.pg
+        assert os.path.exists('/proc/%d'%pid) or not os.path.exists(t)
+
+    tracers = find_tracers()
+    print('\n'.join(['orphan tracer instances:']+tracers))
 
 if __name__ == '__main__':
     main()

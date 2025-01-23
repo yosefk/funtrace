@@ -278,6 +278,7 @@ struct trace_global_state
     bool exiting = false; //when we're exiting the program we're no longer
     //deferring the destruction of trace buffers to avoid memory leaks
     //(not that it matters but it's extra noise in leak reporting tools)
+    bool tracing_paused = false;
 
     NOINSTR trace_global_state()
     {
@@ -302,6 +303,10 @@ struct trace_global_state
         g_thread_trace.allocate(log_buf_size);
 
         std::lock_guard<std::mutex> guard(mutex);
+        if(tracing_paused) {
+            g_thread_trace.pause_tracing(); //will be resumed by trace_state::resume_tracing()
+        }
+
         g_thread_trace.id.pid = pid;
         g_thread_trace.id.tid = gettid();
         g_thread_trace.thread = pthread_self();
@@ -356,6 +361,22 @@ struct trace_global_state
             thread_traces[i] = thread_traces.back();
             thread_traces.pop_back();
             --i;
+        }
+    }
+
+    void NOINSTR pause_tracing()
+    {
+        tracing_paused = true; //for to-be-created threads
+        for(auto trace : thread_traces) { //for running threads
+            trace->pause_tracing();
+        }
+    }
+
+    void NOINSTR resume_tracing()
+    {
+        tracing_paused = false;
+        for(auto trace : thread_traces) {
+            trace->resume_tracing();
         }
     }
 };
@@ -552,9 +573,8 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
 {
     std::lock_guard<std::mutex> guard(trace_state().mutex);
 
-    for(auto trace : trace_state().thread_traces) {
-        trace->pause_tracing();
-    }
+    trace_state().pause_tracing();
+
     std::ostream& file = trace_state().file();
     std::stringstream procmaps;
     get_procmaps(procmaps);
@@ -573,9 +593,7 @@ extern "C" void NOINSTR funtrace_pause_and_write_current_snapshot()
     write_funtrace(file);
     write_tracebufs(file, traces);
 
-    for(auto trace : trace_state().thread_traces) {
-        trace->resume_tracing();
-    }
+    trace_state().resume_tracing();
 
     std::vector<std::string> ftrace_snapshot;
     ftrace_events_snapshot(ftrace_snapshot);
@@ -597,9 +615,9 @@ struct funtrace_snapshot
 funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
 {
     std::lock_guard<std::mutex> guard(trace_state().mutex);
-    for(auto trace : trace_state().thread_traces) {
-        trace->pause_tracing();
-    }
+
+    trace_state().pause_tracing();
+
     funtrace_snapshot* snapshot = new funtrace_snapshot;
     for(auto trace : trace_state().thread_traces) {
         trace_entry* copy = (trace_entry*)new char[trace->buf_size];
@@ -607,9 +625,9 @@ funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot()
         trace->update_name();
         snapshot->thread_traces.push_back(event_buffer{copy, trace->buf_size, trace->id});
     }
-    for(auto trace : trace_state().thread_traces) {
-        trace->resume_tracing();
-    }
+
+    trace_state().resume_tracing();
+
     ftrace_events_snapshot(snapshot->ftrace_events);
     get_procmaps(snapshot->procmaps);
     return snapshot;
@@ -680,9 +698,9 @@ static trace_entry* NOINSTR find_earliest_event_after(trace_entry* begin, trace_
 extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time)
 {
     std::lock_guard<std::mutex> guard(trace_state().mutex);
-    for(auto trace : trace_state().thread_traces) {
-        trace->pause_tracing();
-    }
+
+    trace_state().pause_tracing();
+
     funtrace_snapshot* snapshot = new funtrace_snapshot;
     uint64_t pause_time = funtrace_time();
     for(auto trace : trace_state().thread_traces) {
@@ -707,9 +725,9 @@ extern "C" struct funtrace_snapshot* NOINSTR funtrace_pause_and_get_snapshot_sta
         trace->update_name();
         snapshot->thread_traces.push_back(event_buffer{copy, entries*sizeof(trace_entry), trace->id});
     }
-    for(auto trace : trace_state().thread_traces) {
-        trace->resume_tracing();
-    }
+
+    trace_state().resume_tracing();
+
     ftrace_events_snapshot(snapshot->ftrace_events, time);
     get_procmaps(snapshot->procmaps);
     return snapshot;
@@ -736,18 +754,14 @@ extern "C" void NOINSTR funtrace_set_thread_log_buf_size(int log_buf_size)
 extern "C" void NOINSTR funtrace_disable_tracing()
 {
     std::lock_guard<std::mutex> guard(trace_state().mutex);
-    for(auto trace : trace_state().thread_traces) {
-        trace->pause_tracing();
-    }
+    trace_state().pause_tracing();
 }
 
 
 extern "C" void NOINSTR funtrace_enable_tracing()
 {
     std::lock_guard<std::mutex> guard(trace_state().mutex);
-    for(auto trace : trace_state().thread_traces) {
-        trace->resume_tracing();
-    }
+    trace_state().resume_tracing();
 }
 
 // we interpose pthread_create in order to implement the thing that having
@@ -891,6 +905,7 @@ __cxa_throw(void* thrown_object, std::type_info* type_info, void (_GLIBCXX_CDTOR
 #include <csignal>
 #include <condition_variable>
 #include <chrono>
+#include <dirent.h>
 
 //we register a signal handler for SIGTRAP, and have a thread waiting for the signal
 //to arrive and dumping trace data when it does. this is good for programs you don't
@@ -955,6 +970,7 @@ struct funtrace_gc
     std::condition_variable cond_var;
     std::thread thread;
     int gc_period_ms;
+    std::atomic<bool> done;
 
     NOINSTR funtrace_gc()
     {
@@ -962,6 +978,7 @@ struct funtrace_gc
         if(gc_period_ms == 0) {
             return;
         }
+        done = false;
         thread = std::thread([this] {
             thread_func();
         });
@@ -971,7 +988,7 @@ struct funtrace_gc
         if(gc_period_ms == 0) {
             return;
         }
-        {
+        while(!done) {
             std::lock_guard<std::mutex> guard(mutex);
             cond_var.notify_one();
         }
@@ -994,6 +1011,7 @@ void NOINSTR funtrace_gc::thread_func()
             break;
         }
     }
+    done = true;
 }
 
 #endif
@@ -1019,9 +1037,11 @@ struct ftrace_handler
     int pos = 0;
     bool started = false;
     std::atomic<bool> quit;
+    std::atomic<bool> done;
 
     NOINSTR ftrace_handler() {
         quit = false;
+        done = false;
         int events_in_buf = FUNTRACE_FTRACE_EVENTS_IN_BUF;
         const char* env = getenv("FUNTRACE_FTRACE_EVENTS_IN_BUF");
         if(env) {
@@ -1051,11 +1071,24 @@ struct ftrace_handler
         }
         quit = true;
         //we make sure the thread is awakened by a thread-spawning event,
-        //and then wait for it to quit.
-        auto dummy = std::thread([] {});
+        //and then wait for it to quit. not sure whether we need a loop doing this until
+        //thread thread actually quits or if there's some guarantee that an ftrace
+        //event will be delivered to the reader of trace_pipe in some bounded time if
+        //no other events are arriving
+        while(!done) {
+            auto dummy = std::thread([] {
+                //might help debug things if they go wrong
+                pthread_setname_np(pthread_self(), "quit-ftrace-loop");
+            });
+            dummy.join();
+        }
         thread.join();
-        dummy.join();
+        rmdir(base.c_str());
+        //we might have leftover tracer instances from previous runs of programs
+        //instrumented with funtrace - now is as good time as any to remove them
+        remove_orphan_tracer_instances();
     }
+    void NOINSTR remove_orphan_tracer_instances();
     void NOINSTR thread_func();
     void NOINSTR ftrace_init();
     void NOINSTR warn(const char* what)
@@ -1107,15 +1140,10 @@ g_ftrace_handler;
 
 void NOINSTR ftrace_handler::ftrace_init()
 {
-    //create our own tracer instance (note that we name it "after ourselves" but we don't
-    //eg mangle the name by PID to ensure it's unique since that would require cleaning it up
-    //upon process termination to avoid creating too many and not sure how this should be done;
-    //there's some trick using mount which apparently requires root permissions/capabilities
-    //or we could have a process removing it when this process dies but this sounds like it
-    //could come with its own problems)
+    //create our own tracer instance
     char buf[128]={0};
-    pthread_getname_np(pthread_self(), buf, sizeof buf);
-    base = std::string("/sys/kernel/tracing/instances/funtrace.") + buf + "/";
+    snprintf(buf, sizeof buf, "/sys/kernel/tracing/instances/funtrace.%d/", getpid());
+    base = buf;
     struct stat s;
     if(stat(base.c_str(), &s) && mkdir(base.c_str(), 0666)) {
         warn(("failed to create ftrace instance directory "+base).c_str());
@@ -1214,6 +1242,42 @@ void NOINSTR ftrace_handler::thread_func()
         }
 
         mutex.unlock();
+    }
+
+    done = 1;
+}
+
+static bool NOINSTR is_pid_alive(int pid) {
+    if(kill(pid, 0) == 0) {
+        return true; // If kill returns 0, the process exists
+    }
+    if(errno == EPERM) { // Permission denied, but process exists
+        return true;
+    }
+    return false; // Process does not exist or other errors
+}
+
+void NOINSTR ftrace_handler::remove_orphan_tracer_instances()
+{
+    //remove /sys/kernel/tracing/instances/funtrace.<pid> if the pid isn't alive
+    DIR *dir;
+    struct dirent *entry;
+
+    if((dir = opendir("/sys/kernel/tracing/instances")) != NULL) {
+        while((entry = readdir(dir)) != NULL) {
+            if(strncmp(entry->d_name, "funtrace.", 9) == 0) {
+                char *end;
+                long pid = strtol(entry->d_name + 9, &end, 10);
+                if(*end == '\0' && !is_pid_alive(pid)) { // Check if the string after funtrace. is a valid integer and if the PID does not exist
+                    //note that just rmdir'ing all of the directories might work as well, since ftrace might not let us remove a still-used
+                    //instance, but checking if the pid is alive seems more civilized?..
+                    std::string full_path = "/sys/kernel/tracing/instances/";
+                    full_path += entry->d_name;
+                    rmdir(full_path.c_str());
+                }
+            }
+        }
+        closedir(dir);
     }
 }
 
