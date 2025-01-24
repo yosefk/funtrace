@@ -279,7 +279,7 @@ impl TraceConverter {
             json.write(br#"{
 "traceEvents": [
 "#)?;
-            println!("decoding a trace sample logged by `{}` into {}...", self.cmd_line, fname);
+            println!("decoding a trace sample logged by `{}` into {} ...", self.cmd_line, fname);
         }
         else {
             println!("inspecting sample {} logged by `{}` (without creating the file...)", fname, self.cmd_line);
