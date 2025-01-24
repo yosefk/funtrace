@@ -399,12 +399,18 @@ struct trace_global_state
     }
 };
 
+//we keep this for funtrace_gdb.py which has trouble accessing trace_state()::g_trace_state
+trace_global_state* g_p_trace_state = nullptr;
+
 //the reason we heap-allocate and leak this object instead of making it a regular
 //global variable is that threads might be terminating during the program destruction
 //sequence, and we need unregister_this_thread() to work, and similarly, we need
 //collect_garbage() to work and it can be called at any moment.
 static trace_global_state& NOINSTR trace_state() {
     static trace_global_state& g_trace_state = *new trace_global_state;
+    if(!g_p_trace_state) {
+        g_p_trace_state = &g_trace_state;
+    }
     return g_trace_state;
 }
 
@@ -1302,33 +1308,39 @@ void NOINSTR ftrace_handler::remove_orphan_tracer_instances()
     }
 }
 
+static inline std::vector<std::string>::iterator NOINSTR copy(std::vector<std::string>::iterator to, const ftrace_event* from_b, const ftrace_event* from_e)
+{
+    while(from_b < from_e) {
+        *to++ = from_b->line;
+        from_b++;
+    }
+    return to;
+}
+
+static inline bool NOINSTR cmp_events(const ftrace_event& e1, const ftrace_event& e2) {
+    return e1.timestamp < e2.timestamp;
+}
+
+static inline const ftrace_event* NOINSTR find_earliest_event_after(const ftrace_event* b, const ftrace_event* e, uint64_t earliest_timestamp)
+{
+    ftrace_event evt;
+    evt.timestamp = earliest_timestamp;
+    auto p = std::lower_bound(b, e, evt, cmp_events);
+    return p == e ? nullptr : p;
+}
+
 void NOINSTR ftrace_handler::events_snapshot(std::vector<std::string>& snapshot, uint64_t earliest_timestamp)
 {
-    auto copy = [](std::vector<std::string>::iterator to, const ftrace_event* from_b, const ftrace_event* from_e) -> std::vector<std::string>::iterator {
-        while(from_b < from_e) {
-            *to++ = from_b->line;
-            from_b++;
-        }
-        return to;
-    };
     std::lock_guard<std::mutex> guard(mutex);
     //the logic here is similar to that in funtrace_pause_and_get_snapshot_starting_at_time -
     //we treat the cyclic buffer as 2 sorted arrays - except there are no complications around
     //data getting overwritten while we're reading it since we're holding a mutex protecting
     //the cyclic buffer
-    auto find_earliest_event_after = [&](const ftrace_event* b, const ftrace_event* e) {
-        ftrace_event evt;
-        evt.timestamp = earliest_timestamp;
-        auto p = std::lower_bound(b, e, evt, [=](const ftrace_event& e1, const ftrace_event& e2) {
-            return e1.timestamp < e2.timestamp;
-        });
-        return p == e ? nullptr : p;
-    };
     auto buf = &events[0];
     auto pos = buf + this->pos;
     auto end = buf + events.size();
-    auto earliest_right = find_earliest_event_after(pos, end);
-    auto earliest_left = find_earliest_event_after(buf, pos);
+    auto earliest_right = find_earliest_event_after(pos, end, earliest_timestamp);
+    auto earliest_left = find_earliest_event_after(buf, pos, earliest_timestamp);
     uint64_t entries = (earliest_left ? pos-earliest_left : 0) + (earliest_right ? end-earliest_right : 0);
     snapshot.resize(entries);
     auto copy_to = snapshot.begin();

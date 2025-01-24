@@ -260,6 +260,9 @@ shared_ref = fn('loop',
 tailcall_clean_ref = (fn('tail_caller', fn('callee')) + fn('tail_caller_untraced'))*3
 tailcall_dirty_ref = (fn('tail_caller') + fn('callee') + fn('tail_caller_untraced'))*3
 
+killed_main_ref = fn('main', fn('g', fn('f')))
+killed_children_ref = fn('g', fn('f'))
+
 freq_ref = [
     (call,'usleep_1500'),
     (ret,'usleep_1500'),
@@ -477,6 +480,10 @@ def main():
     check()
 
     pool.map(run_cmds, killedcmds)
+    for binary in test2bins['killed']:
+        if 'xray' in binary or 'clang' in binary:
+            continue # my gdb is too old to parse the latest LLVM's DWARF; there's no better reason for this condition...
+        check_funtrace_from_core_dump(binary)
     check_orphan_tracer_removal()
 
 jsonmod = json
@@ -556,6 +563,34 @@ def check():
         assert verify_thread(t, freq_ref)
         slept = t[1][-1]-t[0][-1]
         assert slept >= 1500 and slept < 1700, f'wrong sleeping time {slept}'
+
+def check_funtrace_from_core_dump(test):
+    testdir = f'{OUTDIR}/{os.path.basename(test)}'
+    # the test produces an empty trace with no samples to extract to funtrace.json
+    tracejson = f'{testdir}/funtrace.json'
+    assert not os.path.exists(tracejson)
+
+    system(f'cd {testdir} && gdb -q ../../{test} core -x ../../funtrace_gdb.py -ex funtrace -ex quit')
+    system(f'./target/{TARGET}/release/funtrace2viz {testdir}/funtrace.raw {testdir}/funtrace')
+
+    # core dump analysis should produce a sample that will be extraced to funtrace.json
+    assert os.path.exists(tracejson)
+
+    data = parse_perfetto_json(tracejson)
+    threads = data['threads']
+    ftrace = data['systemTraceEvents']
+    assert 'sched_waking: comm=child', f'bad ftrace data:\n{ftrace}'
+    
+    # check that both the active and the recently finished thread were found
+    assert len(threads) == 3
+    assert 'child' in threads
+    for thread in threads.values():
+        is_main = len([name for _,name,_ in thread if name.startswith('main')]) > 0
+        if is_main:
+            # we're checking, in particular, that after saving a snapshot we don't have "noise" trace entries from funtrace itself
+            thread = [(what,name,when) for what,name,when in thread if '_GLOBAL__' not in name and '__static_initialization_and_destruction' not in name]
+        ref = killed_main_ref if is_main else killed_children_ref
+        assert verify_thread(thread, ref)
 
 def check_orphan_tracer_removal():
     def funtrace_pid(s):
