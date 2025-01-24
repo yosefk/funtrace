@@ -572,7 +572,7 @@ def check_orphan_tracer_removal():
     print('\n'.join(['orphan tracer instances:']+tracers))
 
     # could be any funtrace-instrumented program - they clean orphan tracer dirs upon exit
-    system(f'{BUILDDIR}/benchmark.pg')
+    system(f'cd out/benchmark.pg; ../../{BUILDDIR}/benchmark.pg')
     for t in tracers:       
         pid = funtrace_pid(os.path.basename(t))
         # either the PID exists or the tracer was removed by the run of benchmark.pg

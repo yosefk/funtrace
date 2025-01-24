@@ -187,15 +187,13 @@ impl TraceConverter {
         let mut oldest = u64::MAX;
         for entries in sample_entries {
             if self.threads.is_empty() || self.threads.contains(&entries.thread_id.tid) {
-                for entry in entries.trace.iter() {
-                    youngest = max(entry.cycle, youngest);
-                    oldest = min(entry.cycle, oldest);
-                }
+                oldest = min(entries.trace.first().unwrap().cycle, oldest);
+                youngest = max(entries.trace.last().unwrap().cycle, youngest);
             }
         }
-        for event in ftrace_events {
-            youngest = max(event.timestamp, youngest);
-            oldest = min(event.timestamp, oldest);
+        if !ftrace_events.is_empty() {
+            oldest = min(ftrace_events.first().unwrap().timestamp, oldest);
+            youngest = max(ftrace_events.last().unwrap().timestamp, youngest);
         }
         if let Some(max_age) = self.max_event_age {
             youngest - max_age
@@ -482,7 +480,7 @@ impl TraceConverter {
             }
             let name = String::from_utf8(thread_trace.thread_id.name.iter().filter(|&&x| x != 0 as u8).copied().collect()).unwrap();
             if latest_cycle >= earliest_cycle {
-                println!("  thread {} {} - {} recent function calls logged over {} cycles [{} - {}]", thread_trace.thread_id.tid, name, self.num_events, latest_cycle-earliest_cycle, earliest_cycle, latest_cycle);
+                println!("  thread {} {} - {} recent function calls logged over {} cycles [{} - {}]", thread_trace.thread_id.tid, name, self.num_events, latest_cycle-earliest_cycle, earliest_cycle-self.time_base, latest_cycle-self.time_base);
             }
             else {
                 println!("    skipping thread {} {} (all {} logged function entry/return events are too old)", thread_trace.thread_id.tid, name, entries.len());
@@ -505,7 +503,7 @@ impl TraceConverter {
 
             let oldest_ftrace = ftrace_events[0].timestamp;
             let newest_ftrace = ftrace_events[ftrace_events.len()-1].timestamp;
-            println!("  ftrace - {} events logged over {} cycles [{} - {}]", ftrace_events.len(), newest_ftrace-oldest_ftrace, oldest_ftrace, newest_ftrace);
+            println!("  ftrace - {} events logged over {} cycles [{} - {}]", ftrace_events.len(), newest_ftrace-oldest_ftrace, oldest_ftrace-self.time_base, newest_ftrace-self.time_base);
         }
 
         // find the source files containing the functions in this sample's set
