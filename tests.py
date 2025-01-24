@@ -254,6 +254,12 @@ shared_ref = fn('loop',
     fn('h_dyn_shared_c', fn('h_dyn_shared', fn('g_dyn_shared',fn('f_dyn_shared')*2)+fn('f_dyn_shared'))))*3
 )
 
+# the idea was to test tail call support, incl cases when we tail-call a function excluded
+# from tracing; the result of this testing was to dump tail call support since it's not clear
+# how to do it, at least without runtime overhead.
+tailcall_clean_ref = (fn('tail_caller', fn('callee')) + fn('tail_caller_untraced'))*3
+tailcall_dirty_ref = (fn('tail_caller') + fn('callee') + fn('tail_caller_untraced'))*3
+
 freq_ref = [
     (call,'usleep_1500'),
     (ret,'usleep_1500'),
@@ -511,6 +517,9 @@ def check():
     for json in jsons('longjmp'): 
         print('checking',json)
         assert verify_thread(load_thread(json), longjmp_ref)
+    for json in jsons('tailcall'):
+        print('checking',json)
+        assert verify_thread(load_thread(json), tailcall_clean_ref if 'fi-' in json else tailcall_dirty_ref)
     for json in jsons('orphans'): 
         print('checking',json)
         assert verify_thread(load_thread(json), orphans_ref(json))
