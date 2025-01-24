@@ -16,7 +16,6 @@ void NI f()
 void NI g()
 {
     f();
-    n++;
     f();
     n++;
 }
@@ -24,7 +23,6 @@ void NI g()
 void NI h()
 {
     g();
-    n++;
     f();
     n++;
 }
@@ -38,9 +36,7 @@ void NI loop()
 {
     for(int64_t i=0; i<iters; ++i) {
         h();
-        n++;
         h_shared();
-        n++;
         h_shared_2();
         n++;
     }

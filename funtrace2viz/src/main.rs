@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use procaddr2sym::{ProcAddr2Sym, SymInfo};
 use serde_json::Value;
 use clap::Parser;
-use std::cmp::max;
+use std::cmp::{min, max};
 use num::{FromPrimitive, Zero};
 use num::rational::Ratio;
 use num::bigint::BigInt;
@@ -44,6 +44,8 @@ struct Cli {
     out_basename: String,
     #[clap(short, long, help="print the static addresses and executable/shared object files of decoded functions in addition to name, file & line")]
     executable_file_info: bool,
+    #[clap(short, long, help="print the raw timestamps (the default is to subtract the timestamp of the earliest reported event at each sample, so that time starts at 0; in particular it helps to avoid rounding issues you might see with large timestamp values)")]
+    raw_timestamps: bool,
     #[clap(short, long, help="ignore events older than this relatively to the latest recorded event in a given trace sample (very old events create the appearance of a giant blank timeline in vizviewer/Perfetto which zooms out to show the recorded timeline in full)")]
     max_event_age: Option<u64>,
     #[clap(short, long, help="ignore events older than this cycle (like --max-event-age but as a timestamp instead of an age in cycles)")]
@@ -62,6 +64,8 @@ struct TraceConverter {
     source_cache: HashMap<String, SourceCode>,
     sym_cache: HashMap<u64, SymInfo>,
     max_event_age: Option<u64>,
+    raw_timestamps: bool,
+    time_base: u64,
     oldest_event_time: Option<u64>,
     dry: bool,
     samples: Vec<u32>,
@@ -171,32 +175,36 @@ fn rat2dec(rat: &Ratio<BigInt>, decimal_places: u32) -> String {
 impl TraceConverter {
     pub fn new(args: &Cli) -> Self {
         TraceConverter { procaddr2sym: ProcAddr2Sym::new(), source_cache: HashMap::new(), sym_cache: HashMap::new(),
-            max_event_age: args.max_event_age, oldest_event_time: args.oldest_event_time, dry: args.dry,
+            max_event_age: args.max_event_age, raw_timestamps: args.raw_timestamps, time_base: 0,
+            oldest_event_time: args.oldest_event_time, dry: args.dry,
             samples: args.samples.clone(), threads: args.threads.clone(), cpu_freq: 0, cmd_line: "".to_string(),
             first_event_in_json: false, first_event_in_thread: false, num_events: 0
         }
     }
 
     fn oldest_event(&self, sample_entries: &Vec<ThreadTrace>, ftrace_events: &Vec<FtraceEvent>) -> u64 {
-        if let Some(max_age) = self.max_event_age {
-            let mut youngest = 0;
-            for entries in sample_entries {
-                if self.threads.is_empty() || self.threads.contains(&entries.thread_id.tid) {
-                    for entry in entries.trace.iter() {
-                        youngest = max(entry.cycle, youngest);
-                    }
+        let mut youngest = 0;
+        let mut oldest = u64::MAX;
+        for entries in sample_entries {
+            if self.threads.is_empty() || self.threads.contains(&entries.thread_id.tid) {
+                for entry in entries.trace.iter() {
+                    youngest = max(entry.cycle, youngest);
+                    oldest = min(entry.cycle, oldest);
                 }
             }
-            for event in ftrace_events {
-                youngest = max(event.timestamp, youngest);
-            }
+        }
+        for event in ftrace_events {
+            youngest = max(event.timestamp, youngest);
+            oldest = min(event.timestamp, oldest);
+        }
+        if let Some(max_age) = self.max_event_age {
             youngest - max_age
         }
-        else if let Some(oldest) = self.oldest_event_time {
-            oldest
+        else if let Some(oldest_to_report) = self.oldest_event_time {
+            oldest_to_report
         }
         else {
-            0
+            oldest
         }
     }
 
@@ -243,7 +251,7 @@ impl TraceConverter {
             //(despite the beautiful gradient that orphan B events are rendered with)
             json.write(format!(r#"{}{{"tid":{},"ts":{},"dur":{},"name":{},"ph":"X","pid":{}}}"#, "\n,",
                         thread_id.tid,
-                        rat2dec(&(rat(call_cycle)/cycles_per_us.clone() - extra_call.clone()), digits),
+                        rat2dec(&(rat(call_cycle-self.time_base)/cycles_per_us.clone() - extra_call.clone()), digits),
                         rat2dec(&(rat(return_cycle-call_cycle)/cycles_per_us + extra_call + extra_ret), digits),
                         json_name(call_sym), thread_id.pid).as_bytes())?; 
         }    
@@ -296,9 +304,16 @@ impl TraceConverter {
         let mut ftrace_events = parse_ftrace_lines(ftrace_text, fixts);
 
         let oldest = self.oldest_event(sample_entries, &ftrace_events);
+        self.time_base = if self.raw_timestamps { 0 } else { oldest };
 
-        ftrace_events.retain(|event| event.timestamp >= oldest);
+        if self.time_base > 0 {
+            //TODO: a bit wasteful to reparse this just to subtract the time base 
+            let fixts = |ts: u64| format!("{}", rat2dec(&(rat(ts-self.time_base)/cycles_per_second.clone()), 10));
+            ftrace_events = parse_ftrace_lines(ftrace_text, fixts);
+        }
     
+        ftrace_events.retain(|event| event.timestamp >= oldest);
+
         for thread_trace in sample_entries {
             let entries = &thread_trace.trace;
             if !self.threads.is_empty() && !self.threads.contains(&thread_trace.thread_id.tid) {

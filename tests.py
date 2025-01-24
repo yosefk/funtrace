@@ -13,7 +13,7 @@ def parse_perfetto_json(fname):
     events = data['traceEvents']
     threads = {}
     thread_names = {}
-    timestamps = {}
+    thread2timestamps = {}
     for event in events:
         phase = event['ph']
         tid = event['tid']
@@ -30,6 +30,8 @@ def parse_perfetto_json(fname):
         timepoints = threads.setdefault(thread_names[tid], list())
         timestamp = event['ts']
         duration = event['dur']
+
+        timestamps = thread2timestamps.setdefault(tid, dict())
 
         assert timestamp not in timestamps, f'expecting unique timestamps in every thread! 2 events with the same timestamp: call of {event}; {timestamps[timestamp]}'
         assert timestamp+duration not in timestamps, f'expecting unique timestamps in every thread! 2 events with the same timestamp: return of {event}; {timestamps[timestamp+duration]}'
@@ -297,6 +299,54 @@ def check_count_results(symcount_txt):
         assert 'count_dyn_shared.cpp' in info.file
         assert '.so' in info.module
 
+def check_ftrace(ftrace, threads):
+    lines = ftrace.strip().split('\n')
+
+    # we renamed 2 threads, one to "parent" and one to "child"
+    renames = [line for line in lines if 'task_rename' in line]
+    assert len(renames)==2
+    assert 'newcomm=parent' in '\n'.join(renames)
+    assert 'newcomm=child' in '\n'.join(renames)
+
+    # parent and child both slept, we expect them to have been awakened
+    assert 'sched_waking: comm=parent' in ftrace
+    assert 'sched_waking: comm=child' in ftrace
+
+    # find the sleeping periods of parent & child
+    def time(line):
+        t = line.split()[3]
+        assert t.endswith(':')
+        return float(t[:-1])*10**6
+
+    # check that the threads slept, and that the sleep() duration recorded
+    # by funtrace contains the not-runnable duration recorded by ftrace
+    # (this checks timestamp synchronization)
+    for thread in ['parent','child']:
+        start = None
+        finish = None
+        for line in reversed(lines):
+            if f'sched_waking: comm={thread}' in line:
+                finish = time(line)
+            elif finish is not None and f'sched_switch: prev_comm={thread}' in line:
+                start = time(line)
+                break
+        assert start is not None and finish is not None
+        print('thread', thread, 'slept for', finish-start)
+        assert finish-start >= 150000
+
+        func_start = None
+        func_finish = None
+        for what, func, when in threads[thread]:
+            if func.startswith('sleep'):
+                if what == call:
+                    func_start = when
+                else:
+                    func_finish = when
+                    break
+        assert func_start is not None and func_finish is not None
+        print('  in sleep() for', func_finish - func_start)
+        assert start > func_start and finish < func_finish
+
 def system(cmd):
     print('running',cmd)
     status = os.system(cmd)
@@ -305,13 +355,10 @@ def system(cmd):
 
 BUILDDIR = './built-tests'
 OUTDIR = './out'
-# I distincitly remember I once used a different way to build static binaries from Rust
-# but I can't find a way like that now so even though it seems slower than glibc
-# that's what we test since it's nice to release static binaries
-TARGET = 'x86_64-unknown-linux-musl'
+TARGET = 'x86_64-unknown-linux-gnu'
 
 def build_trace_analysis_tools():
-    system(f'cargo build -r --target {TARGET}')
+    system(f'RUSTFLAGS="-C target-feature=+crt-static" cargo build -r --target {TARGET}')
 
 def run_cmds(cmds):
     for cmd in cmds:
@@ -409,6 +456,7 @@ def main():
     buildcmds('freq.cpp')
     buildcmds('killed.cpp')
     buildcmds('sigtrap.cpp')
+    buildcmds('ftrace.cpp')
     buildcmds('shared.cpp',shared=['lib_shared.cpp'],dyn_shared=['lib_dyn_shared.cpp'])
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)
@@ -425,6 +473,7 @@ def main():
     pool.map(run_cmds, killedcmds)
     check_orphan_tracer_removal()
 
+jsonmod = json
 def check():
     print('checking results...')
 
@@ -432,6 +481,8 @@ def check():
         return parse_perfetto_json(json)['threads']
     def load_thread(json):
         return list(load_threads(json).values())[0]
+    def load_ftrace(json):
+        return jsonmod.load(open(json))['systemTraceEvents']
 
     def jsons(test): return sorted(glob.glob(f'{OUTDIR}/{test}.*/funtrace.json'))
 
@@ -477,6 +528,11 @@ def check():
         print('checking',json)
         for thread in load_threads(json).values():
             assert verify_thread(thread, shared_ref)
+    for json in jsons('ftrace'):
+        print('checking',json)
+        ftrace = load_ftrace(json)
+        threads = load_threads(json)
+        check_ftrace(ftrace, threads)
 
     # funcount test
     for symcount_txt in sorted(glob.glob(f'{OUTDIR}/count.*/symcount.txt')):
