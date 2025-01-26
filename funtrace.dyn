@@ -1,15 +1,14 @@
 {
-  funtrace_disable_tracing;
-  funtrace_enable_tracing;
-  funtrace_free_procmaps;
-  funtrace_free_snapshot;
-  funtrace_get_procmaps;
-  funtrace_ignore_this_thread;
+  funtrace_pause_and_write_current_snapshot;
   funtrace_pause_and_get_snapshot;
+  funtrace_time;
+  funtrace_ticks_per_second;
   funtrace_pause_and_get_snapshot_starting_at_time;
   funtrace_pause_and_get_snapshot_up_to_age;
-  funtrace_pause_and_write_current_snapshot;
-  funtrace_ticks_per_second;
-  funtrace_time;
-  funtrace_write_saved_snapshot;
+  funtrace_free_snapshot;
+  funtrace_write_snapshot;
+  funtrace_ignore_this_thread;
+  funtrace_set_thread_log_buf_size;
+  funtrace_disable_tracing;
+  funtrace_enable_tracing;
 };
