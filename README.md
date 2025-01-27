@@ -6,6 +6,14 @@ A function call tracer is a kind of profiler showing **a timeline of function ca
 
 Here we can see 2 threads - whether they're running or waiting, and the changes to their callstack over time - and the source code of a selected function.
 
+Unlike a sampling profiler such as perf, **a tracing profiler must be told what to trace** using some runtime API, and also has a **higher overhead**
+than the fairly low-frequency sampling of the current callstack a-la perf. What do you get in return for the hassle and the overhead (and the hassle of culling
+the overhead, by disabling tracing of short functions called very often)? Unlike flamegraphs showing where the program spends its time on average,
+traces let you **debug cases of unusually high latency**, including in production (and it's a great idea to collect traces in production, and not just during development!)
+
+For a long read about why tracing profilers are useful and how funtrace works, see [Profiling in production with function call traces](https://yosefk.com/blog/profiling-in-production-with-function-call-traces.html).
+What follows is a short funtrace user guide.
+
 # Why funtrace?
 
 * **Low overhead tracing** (FWIW, in my microbenchmark I get <10 ns per instrumented call or return -
