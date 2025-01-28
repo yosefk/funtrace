@@ -76,6 +76,27 @@ tracing is on by default.
 
 **TODO** binary releases of the decoding tools
 
+The above is how you can give funtrace a quick try. The rest tells how to integrate it in your program "for real."
+
+# Choosing compiler instrumentation
+
+Funtrace relies on the compiler inserting hooks upon function calls and returns. Funtrace supports 2 instrumentation methods for gcc, and 2 more for clang. "By default," the method used by funtrace-pg-g++ and funtrace-finstr-clang++
+is recommended for gcc and clang, respectively - but for each compiler, there are reasons to use the other method. Here's a table of the methods and their pros and cons, followed by a detailed explanation:
+
+Method | gcc -finstrument-functions | gcc -pg | clang -finstrument-functions | clang XRay
+--- | --- | --- | --- | --- 
+before or after inlining? | ❌ before | ✅ after | ✅✅ before or after! | ✅ after
+tail call artifact | ✅ no | ❌ yes | ✅ no | ❌ yes
+untraced exception catcher artifact | ✅ no | ❌ yes | ❌ yes | ❌ yes
+control tracing by source path | ✅ yes | ❌ no | ❌ no | ❌ no
+control tracing by function length | ❌ no | ❌ no | ❌ no | ✅ yes
+
+We'll now explain these items in detail, and add a few points about XRay which "don't fit into the table."
+
+* **Instrument before or after inlining?** You usually prefer "after" - "before" is likely to hurt performance too much, and require suppressing tracing manually in too many places to regain the lost performance. Still, instrumenting
+  before inlining has its uses, eg you can trace the program flow and follow it in vizviewer - for an interactive and/or multithreaded program, this might be easier than using a debugger or an IDE. clang -finstrument-functions is
+  the nicest here - it instruments before inlining, but has a sister flag -finstrument-functions-after-inlining that does what you expect.
+
 # Compiling & linking with funtrace
 
 # Runtime API for taking & saving trace snapshots
