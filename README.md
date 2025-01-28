@@ -86,8 +86,8 @@ is recommended for gcc and clang, respectively - but for each compiler, there ar
 Method | gcc -finstrument-functions | gcc -pg | clang -finstrument-functions | clang XRay
 --- | --- | --- | --- | --- 
 before or after inlining? | ❌ before | ✅ after | ✅✅ before or after! | ✅ after
-tail call artifact | ✅ no | ❌ yes | ✅ no | ❌ yes
-untraced exception catcher artifact | ✅ no | ❌ yes | ❌ yes | ❌ yes
+tail call artifacts | ✅ no | ❌ yes | ✅ no | ❌ yes
+untraced exception catcher artifacts | ✅ no | ❌ yes | ❌ yes | ❌ yes
 control tracing by source path | ✅ yes | ❌ no | ❌ no | ❌ no
 control tracing by function length | ❌ no | ❌ no | ❌ no | ✅ yes
 
@@ -96,6 +96,14 @@ We'll now explain these items in detail, and add a few points about XRay which "
 * **Instrument before or after inlining?** You usually prefer "after" - "before" is likely to hurt performance too much, and require suppressing tracing manually in too many places to regain the lost performance. Still, instrumenting
   before inlining has its uses, eg you can trace the program flow and follow it in vizviewer - for an interactive and/or multithreaded program, this might be easier than using a debugger or an IDE. clang -finstrument-functions is
   the nicest here - it instruments before inlining, but has a sister flag -finstrument-functions-after-inlining that does what you expect.
+* **Tail call artifacts** is when f calls g, the last thing g does is calling h, and instead of seeing f calling g _which calls h_, you see f calling g _and then h_. This is an artifact of when the "on return" hook is called by
+  the compiler - it happens when it's called before the tail call. Not a huge deal but throws you off a bit when viewing traces.
+* **Untraced exception catcher artifacts** is when you have a function with a `try/catch` block and tracing is disabled for it, an exception is thrown, and it looks like _all_ the functions returned and you start from an empty
+  call stack, instead of the correct picture where you return to the function that caught the exception. This artifact comes from most instrumentation methods not calling the "on return" hook when unwinding the stack. This annoyance
+  is avoided as long as you enable tracing for functions catching exceptions (in which case funtrace traces enough info to get around the return hook not being called upon unwinding.)
+* **Control tracing by source path** - gcc's `-finstrument-functions-exclude-file-list=.h,.hpp,/usr/include` (for example) will disable tracing in functions with filenames having the substrings on the comma-separated list. This
+  can someone compensate for -finstrument-functions instrumenting before inlining, and you might otherwise use it for "targeted tracing." 
+* **Control tracing by function length** - XRay has `-fxray-instruction-threshold=N` which excludes short functions from tracing unless they have loops that XRay assumes will run for a long time.
 
 # Compiling & linking with funtrace
 
