@@ -118,10 +118,19 @@ A few more words about XRay:
 
 The short story is, **choose an instrumentation method and then compile in the way the respective wrapper in compiler-wrappers does.** However, here are some points worth noting explicitly:
 
-** **It's fine to compile funtrace.cpp with its own compilation command.** You probably don't want to compile funtrace.cpp when linking your binary the way the wrappers do. They only do it to save you the trouble of adding funtrace.cpp to the list of files for the build system to build (which is harder/more annoying than it sounds, if you're trying to trace someone else's program which build system you don't really know.)
-** **It's best to compile funtrace.cpp without tracing, but "it can handle" being compiled with tracing.** Many build systems make it hard to compile a given file with its own compiler flags. funtrace.cpp uses NOFUNTRACE heavily to suppress tracing; the worst that can happen if you compile it with tracing is that some of its code will be traced despite its best efforts, but it should otherwise work.
-** **funtrace.cpp must be compiled _into the executable_, not any of the shared libraries.** Funtrace uses TLS (thread-local storage) and accessing a `thread_local` object is a simple register+offset access when you link the code into an executable, but requires a function call if you link the code into a shared library, because now you need to find _this shared library's TLS area_. So funtrace puts its on-entry/return hooks into the executable, which exports them to the shared libraries.
-
+* **It's fine to compile funtrace.cpp with its own compilation command.** You probably don't want to compile funtrace.cpp when linking your binary the way the wrappers do. They only do it to save you the trouble of adding funtrace.cpp to the list of files for the build system to build (which is harder/more annoying than it sounds, if you're trying to trace someone else's program with a build system you don't really know.)
+* **It's best to compile funtrace.cpp without tracing, but "it can handle" being compiled with tracing.** Many build systems make it hard to compile a given file with its own compiler flags. funtrace.cpp uses NOFUNTRACE heavily to suppress tracing; the worst that can happen if you compile it with tracing is that some of its code will be traced despite its best efforts, but it should otherwise work.
+* **funtrace.cpp must be compiled _into the executable_, not any of the shared libraries.** Funtrace uses TLS (thread-local storage) and accessing a `thread_local` object is a simple register+offset access when you link the code into an executable, but requires a function call if you link the code into a shared library, because now you need to find _this shared library's TLS area_. So funtrace puts its on-entry/return hooks into the executable, which exports them to the shared libraries.
+* **Linker flag requirements** (XRay/`--allow-multiple-definition`, -pg/`-Wl,--no-undefined`) are documented in the previous section; for XRay, you also **need a linker wrapper** like `compiler-wrappers/xray/ld` to make sure funtrace's on-entry/return hooks from funtrace.o are passed before XRay's own hooks on the linker command line.
+* **Pass -pthread** or things will break annoyingly
+* **-Wl,--dynamic-list=funtrace.dyn** exports the funtrace runtime API from the executable for the shared libraries
+* **-g is for source line info** (it's generally a good idea to use -g in release builds and not just debug builds - if it slows down linking, mold takes care of that; but, if you don't want to compile with -g, funtrace will still give you the function names using the ELF symbol table, only the source code will be missing from vizviewer)
+* **Do _not_ pass -pg _to the linker_** - if you use gcc with -pg, and do pass it to the linker, the linker will think that you're compiling for gprof (even if you also pass `-mfentry -minstrument-return=call` which are guaranteed to break gprof, -pg's original application...), and then your program will write a useless gmon.out file in the current directory every time you run it.
+* **Some flags in the wrappers are "defaults" that you can change**, specifically:
+  * `g++ -finstrument-functions-exclude-file-list=.h,.hpp,/usr/include` - of course you can pass a different exclude list
+  * `clang++ -finstrument-functions-after-inlining` - you can instead pass -finstrument-functions to instrument before inlining
+  * `-fxray-instruction-threshold=...` is _not_ passed by the XRay wrapper - you can set your own threshold
+  
 # Runtime API for taking & saving trace snapshots
 
 # Decoding traces
