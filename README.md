@@ -80,10 +80,16 @@ The above is how you can give funtrace a quick try. The rest tells how to integr
 
 # Choosing compiler instrumentation
 
-Funtrace relies on the compiler inserting hooks upon function calls and returns. Funtrace supports 2 instrumentation methods for gcc, and 2 more for clang. "By default," the method used by funtrace-pg-g++ and funtrace-finstr-clang++
-is recommended for gcc and clang, respectively - but for each compiler, there are reasons to use the other method. Here's a table of the methods and their pros and cons, followed by a detailed explanation:
+Funtrace relies on the compiler inserting hooks upon function calls and returns. Funtrace supports 4 instrumentation methods (2 for gcc and 2 for clang), and comes with a compiler wrapper script passing the right flags to use each:
 
-Method | gcc -finstrument-functions | gcc -pg | clang -finstrument-functions | clang XRay
+* **funtrace-finstr-g++** - gcc with `-finstrument-functions`
+* **funtrace-pg-g++** - gcc with `-pg -mfentry -minstrument-return=call`
+* **funtrace-finstr-clang++** - clang with `-finstrument-functions`
+* **funtrace-xray-clang++** - clang with `-fxray-instrument`
+
+**"By default," the method used by funtrace-pg-g++ and funtrace-finstr-clang++ is recommended for gcc and clang, respectively**. However, for each compiler, there are reasons to use the other method. Here's a table of the methods and their pros and cons, followed by a detailed explanation:
+
+Method | gcc -finstr | gcc -pg | clang -finstr | clang XRay
 --- | --- | --- | --- | --- 
 before or after inlining? | ❌ before | ✅ after | ✅✅ before or after! | ✅ after
 tail call artifacts | ✅ no | ❌ yes | ✅ no | ❌ yes
@@ -93,17 +99,18 @@ control tracing by function length | ❌ no | ❌ no | ❌ no | ✅ yes
 
 We'll now explain these items in detail, and add a few points about XRay which "don't fit into the table."
 
-* **Instrument before or after inlining?** You usually prefer "after" - "before" is likely to hurt performance too much, and require suppressing tracing manually in too many places to regain the lost performance. Still, instrumenting
-  before inlining has its uses, eg you can trace the program flow and follow it in vizviewer - for an interactive and/or multithreaded program, this might be easier than using a debugger or an IDE. clang -finstrument-functions is
-  the nicest here - it instruments before inlining, but has a sister flag -finstrument-functions-after-inlining that does what you expect.
-* **Tail call artifacts** is when f calls g, the last thing g does is calling h, and instead of seeing f calling g _which calls h_, you see f calling g _and then h_. This is an artifact of when the "on return" hook is called by
-  the compiler - it happens when it's called before the tail call. Not a huge deal but throws you off a bit when viewing traces.
-* **Untraced exception catcher artifacts** is when you have a function with a `try/catch` block and tracing is disabled for it, an exception is thrown, and it looks like _all_ the functions returned and you start from an empty
-  call stack, instead of the correct picture where you return to the function that caught the exception. This artifact comes from most instrumentation methods not calling the "on return" hook when unwinding the stack. This annoyance
-  is avoided as long as you enable tracing for functions catching exceptions (in which case funtrace traces enough info to get around the return hook not being called upon unwinding.)
-* **Control tracing by source path** - gcc's `-finstrument-functions-exclude-file-list=.h,.hpp,/usr/include` (for example) will disable tracing in functions with filenames having the substrings on the comma-separated list. This
-  can someone compensate for -finstrument-functions instrumenting before inlining, and you might otherwise use it for "targeted tracing." 
-* **Control tracing by function length** - XRay has `-fxray-instruction-threshold=N` which excludes short functions from tracing unless they have loops that XRay assumes will run for a long time.
+* **Instrument before or after inlining?** You usually prefer "after" - "before" is likely to hurt performance too much (and you can use the NOFUNTRACE macro to suppress the tracing of a function, but you'll need to do this in too many places.) Still, instrumenting before inlining has its uses, eg you can trace the program flow and follow it in vizviewer - for an interactive and/or multithreaded program, this might be easier than using a debugger or an IDE. clang -finstrument-functions is the nicest here - it instruments before inlining, but has a sister flag -finstrument-functions-after-inlining that does what you expect.
+* **Tail call artifacts** is when f calls g, the last thing g does is calling h, and instead of seeing f calling g _which calls h_, you see f calling g _and then h_. This happens because the compiler calls the "on return" hook from g before g's tail call to h. An annoyance if not a huge deal.
+* **Untraced exception catcher artifacts** is when you have a function with a `try/catch` block _and_ tracing is disabled for it. In such a case, when an exception is thrown & caught, it looks like _all_ the functions returned and you start from a freshly empty call stack - instead of the correct picture (returning to the function that caught the exception.) This artifact comes from most instrumentation methods not calling the "on return" hook when unwinding the stack. This annoyance is avoided as long as you enable tracing for functions catching exceptions (in which case funtrace traces enough info to get around the return hook not being called upon unwinding.)
+* **Control tracing by source path** - gcc's `-finstrument-functions-exclude-file-list=.h,.hpp,/usr/include` (for example) will disable tracing in functions with filenames having the substrings on the comma-separated list. This can somewhat compensate for -finstrument-functions instrumenting before inlining, and you might otherwise use this feature for "targeted tracing." 
+* **Control tracing by function length** - XRay has `-fxray-instruction-threshold=N` which excludes short functions from tracing, unless they have loops that XRay assumes will run for a long time.
+
+A few words about XRay which is its own thing:
+
+* **XRay instrumentation was enabled in shared libraries in late 2024** and is not yet available in officially released versions. clang versions with XRay shared library support have the `-fxray-shared` flag.
+* **XRay uses dynamic code patching for enabling/disabling tracing at runtime.** This is why tracing is off unless you run under `env XRAY_OPTIONS="patch_premain=true"`, or use XRay's runtime APIs to patch the code. Funtrace has its own API, `funtrace_enable/disable_tracing()`, but it deliberately _doesn't_ call XRay's code-patching APIs. Funtrace's API is a quick way to cut most of the overhead of tracing without any self-modifying code business. It's up to you to decide, if you use XRay, whether you want to cut even more overhead by using runtime patching - downsides include creating copies of the code pages, for which you might not have the extra space, and taking more time than funtrace_enable/disable_tracing().
+* **Currently, funtrace's XRay support passes --allow-multiple-definition to the linker.** That's because funtrace needs to redefine XRay's on-call/on-return hooks, and there doesn't seem to be another way to do it. If XRay defines its hooks as "weak", this flag will no longer be needed.
+  
 
 # Compiling & linking with funtrace
 
