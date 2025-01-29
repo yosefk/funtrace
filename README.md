@@ -96,6 +96,7 @@ tail call artifacts | ✅ no | ❌ yes | ✅ no | ❌ yes
 untraced exception catcher artifacts | ✅ no | ❌ yes | ❌ yes | ❌ yes
 control tracing by source path | ✅ yes | ❌ no | ❌ no | ❌ no
 control tracing by function length | ❌ no | ❌ no | ❌ no | ✅ yes
+needs questionable linker flags | ✅ no | ❌ yes | ✅ no | ❌ yes
 
 We'll now explain these items in detail, and add a few points about XRay which "don't fit into the table."
 
@@ -104,15 +105,22 @@ We'll now explain these items in detail, and add a few points about XRay which "
 * **Untraced exception catcher artifacts** is when you have a function with a `try/catch` block _and_ tracing is disabled for it. In such a case, when an exception is thrown & caught, it looks like _all_ the functions returned and you start from a freshly empty call stack - instead of the correct picture (returning to the function that caught the exception.) This artifact comes from most instrumentation methods not calling the "on return" hook when unwinding the stack. This annoyance is avoided as long as you enable tracing for functions catching exceptions (in which case funtrace traces enough info to get around the return hook not being called upon unwinding.)
 * **Control tracing by source path** - gcc's `-finstrument-functions-exclude-file-list=.h,.hpp,/usr/include` (for example) will disable tracing in functions with filenames having the substrings on the comma-separated list. This can somewhat compensate for -finstrument-functions instrumenting before inlining, and you might otherwise use this feature for "targeted tracing." 
 * **Control tracing by function length** - XRay has `-fxray-instruction-threshold=N` which excludes short functions from tracing, unless they have loops that XRay assumes will run for a long time.
+* **Questionable linker flags**:
+  * **clang XRay requires --allow-multiple-definition**. That's because funtrace needs to redefine XRay's on-call/on-return hooks, and there doesn't seem to be another way to do it. If XRay defines its hooks as "weak", this flag will no longer be needed.
+  * **gcc -pg _precludes_ -Wl,--no-undefined**. That's because its on-return hook, `__return__`, doesn't have a default definition (though its on-entry hook, `__fentry__`, apprently does, as do the entry/return hooks called by -finstrument-functions); your shared objects will get it from the executable but they won't link with `-Wl,--no-undefined`.
 
-A few words about XRay which is its own thing:
+A few more words about XRay:
 
 * **XRay instrumentation was enabled in shared libraries in late 2024** and is not yet available in officially released versions. clang versions with XRay shared library support have the `-fxray-shared` flag.
 * **XRay uses dynamic code patching for enabling/disabling tracing at runtime.** This is why tracing is off unless you run under `env XRAY_OPTIONS="patch_premain=true"`, or use XRay's runtime APIs to patch the code. Funtrace has its own API, `funtrace_enable/disable_tracing()`, but it deliberately _doesn't_ call XRay's code-patching APIs. Funtrace's API is a quick way to cut most of the overhead of tracing without any self-modifying code business. It's up to you to decide, if you use XRay, whether you want to cut even more overhead by using runtime patching - downsides include creating copies of the code pages, for which you might not have the extra space, and taking more time than funtrace_enable/disable_tracing().
-* **Currently, funtrace's XRay support passes --allow-multiple-definition to the linker.** That's because funtrace needs to redefine XRay's on-call/on-return hooks, and there doesn't seem to be another way to do it. If XRay defines its hooks as "weak", this flag will no longer be needed.
-  
 
 # Compiling & linking with funtrace
+
+The short story is, **choose an instrumentation method and then compile in the way the respective wrapper in compiler-wrappers does.** However, here are some points worth noting explicitly:
+
+** **It's fine to compile funtrace.cpp with its own compilation command.** You probably don't want to compile funtrace.cpp when linking your binary the way the wrappers do. They only do it to save you the trouble of adding funtrace.cpp to the list of files for the build system to build (which is harder/more annoying than it sounds, if you're trying to trace someone else's program which build system you don't really know.)
+** **It's best to compile funtrace.cpp without tracing, but "it can handle" being compiled with tracing.** Many build systems make it hard to compile a given file with its own compiler flags. funtrace.cpp uses NOFUNTRACE heavily to suppress tracing; the worst that can happen if you compile it with tracing is that some of its code will be traced despite its best efforts, but it should otherwise work.
+** **funtrace.cpp must be compiled _into the executable_, not any of the shared libraries.** Funtrace uses TLS (thread-local storage) and accessing a `thread_local` object is a simple register+offset access when you link the code into an executable, but requires a function call if you link the code into a shared library, because now you need to find _this shared library's TLS area_. So funtrace puts its on-entry/return hooks into the executable, which exports them to the shared libraries.
 
 # Runtime API for taking & saving trace snapshots
 
