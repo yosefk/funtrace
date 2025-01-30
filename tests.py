@@ -263,6 +263,9 @@ tailcall_dirty_ref = (fn('tail_caller') + fn('callee') + fn('tail_caller_untrace
 killed_main_ref = fn('main', fn('g', fn('f')))
 killed_children_ref = fn('g', fn('f'))
 
+# short_function and long_but_blacklisted should be filtered out
+asm_filter_ref = fn('short_but_whitelisted') + fn('long_enough_function')
+
 freq_ref = [
     (call,'usleep_1500'),
     (ret,'usleep_1500'),
@@ -466,6 +469,7 @@ def main():
     buildcmds('killed.cpp')
     buildcmds('sigtrap.cpp')
     buildcmds('ftrace.cpp')
+    buildcmds('asm_filter.cpp',flags=f'-funtrace-instr-thresh=20 -funtrace-no-trace={os.path.realpath("tests/no-trace.txt")} -funtrace-do-trace={os.path.realpath("tests/do-trace.txt")}')
     buildcmds('shared.cpp',shared=['lib_shared.cpp'],dyn_shared=['lib_dyn_shared.cpp'])
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)
@@ -544,6 +548,10 @@ def check():
         print('checking',json)
         for thread in load_threads(json).values():
             assert verify_thread(thread, shared_ref)
+    for json in jsons('asm_filter'):
+        print('checking',json)
+        if 'xray' not in json: # we don't support asm filtering for XRay
+            assert verify_thread(load_thread(json), asm_filter_ref)
     for json in jsons('ftrace'):
         print('checking',json)
         ftrace = load_ftrace(json)

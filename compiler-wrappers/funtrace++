@@ -32,7 +32,7 @@ class TraceSupressor:
             reason = f'{funcname} listed in the trace suppression file {self.no_file}'
         elif num_instr < self.instr_thresh:
             reason = f'{funcname} has {num_instr} instructions, less than -funtrace-instr-thresh={self.instr_thresh}'
-        if self.verbose:
+        if self.verbose and reason:
             print(reason)
         return reason
 
@@ -75,10 +75,12 @@ def filter_asm(asm_file, suppressor):
             
             for j in range(funcstart, i):
                 l = lines[j].strip()
-                if l.startswith('call'):
-                    for hook in hooks:
+                for hook in hooks:
+                    if 'call' in l or 'jmp' in l:
                         if hook in l:
                             lines[j] = '# ' + lines[j] + ' # ' + suppression_reason
+                            if 'jmp' in l: # tail call
+                                lines[j] = '    ret ' + lines[j]
                             changed = True
                             break
         elif infunc:
@@ -116,8 +118,13 @@ def compile_and_assemble_commands(cmd):
     cfile = None
     sfile = None
 
+    extensions = 'c cpp cc cxx cp CPP c++ C'.split()
     def is_src_arg(arg):
-        return not arg.startswith('-') and (arg.endswith('.cpp') or arg.endswith('.c'))
+        if arg.startswith('-'):
+           return False
+        for ext in extensions:
+           if arg.endswith(ext):
+               return True
 
     for i,arg in enumerate(cmd):
         if arg == '-o' and i+1 < len(cmd):
@@ -131,18 +138,13 @@ def compile_and_assemble_commands(cmd):
             ofile = cfile[:cfile.rfind('.')] + '.o'
             sfile = cfile[:cfile.rfind('.')] + '.s'
             compile_to_asm_cmd = [('-S' if arg == '-c' else arg) for arg in cmd] + ['-o',sfile]
-            assemble_cmd = [(sfile if is_src_arg(arg) else arg) for arg in cmd] + ['-o',ofile]
         else:
             compile_to_asm_cmd = [('-S' if arg == '-c' else (sfile if arg == ofile else arg)) for arg in cmd]
-            assemble_cmd = [(sfile if is_src_arg(arg) else arg) for arg in cmd]
     else:
         print(f'funtrace++ - WARNING: -c passed but could not determine the input source file in `{cmd}`')
         exec_compiler(cmd)
 
-    if 'clang' in cmd[0]:
-        assemble_cmd += ['-Wno-unused-command-line-argument'] # when assembling a lot of compilation arguments become "unused" and clang warns about
-        assemble_cmd += ['-Wa,-W'] # clang produces assembly using MD5 sums for some source files but not others and then the assembler warns of
-        # "inconsistent use of md5 sums", not sure how to suppress this better...
+    assemble_cmd = [cmd[0], '-c', sfile, '-o', ofile]
 
     return compile_to_asm_cmd, assemble_cmd, sfile
 
@@ -150,7 +152,7 @@ def main():
     cmd = sys.argv[1:]
     funtrace_args = [arg for arg in cmd if arg.startswith('-funtrace-')]
     cmd = [arg for arg in cmd if not arg.startswith('-funtrace-')]
-    if '-c' in cmd:
+    if '-c' in cmd and '-E' not in cmd and '-dM' not in cmd and funtrace_args:
         compile_filter_and_assemble(cmd, funtrace_args)
     else:
         exec_compiler(cmd)

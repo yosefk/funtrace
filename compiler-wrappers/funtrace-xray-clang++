@@ -20,4 +20,4 @@ if linking:
 
 # currently funtrace++ doesn't support filtering of XRay compiler output so we run clang++ directly
 clangpath = subprocess.getoutput('which clang++')
-os.execl(clangpath, *([clangpath] + args))
+os.execl(clangpath, *([clangpath] + [arg for arg in args if not arg.startswith('-funtrace')]))
