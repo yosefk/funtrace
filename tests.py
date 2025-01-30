@@ -569,6 +569,7 @@ def check_funtrace_from_core_dump(test):
     # the test produces an empty trace with no samples to extract to funtrace.json
     tracejson = f'{testdir}/funtrace.json'
     assert not os.path.exists(tracejson)
+    assert os.path.exists(f'{testdir}/core'), f'{testdir}/core not found - is your /proc/sys/kernel/core_pattern set to "core", and is core dump size unlimited in the shell?'
 
     system(f'cd {testdir} && gdb -q ../../{test} core -x ../../funtrace_gdb.py -ex funtrace -ex quit')
     system(f'./target/{TARGET}/release/funtrace2viz {testdir}/funtrace.raw {testdir}/funtrace')

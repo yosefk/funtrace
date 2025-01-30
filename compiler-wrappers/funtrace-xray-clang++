@@ -18,5 +18,6 @@ if linking:
     else:
         args += ['-fxray-shared','fun_xray_so.S'] # this requires a pretty new version of LLVM; older ones can't instrument inside shared objects
 
+# currently funtrace++ doesn't support filtering of XRay compiler output so we run clang++ directly
 clangpath = subprocess.getoutput('which clang++')
 os.execl(clangpath, *([clangpath] + args))

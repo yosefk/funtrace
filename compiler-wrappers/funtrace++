@@ -1,0 +1,159 @@
+#!/usr/bin/python3
+'''
+usage: funtrace++ </path/to/clang++ or g++> [-funtrace-instr-thresh=N] [-funtrace-no-trace=<mangled-names-list-file>] [-funtrace-do-trace=<names-file>] <compiler command>
+'''
+import os, sys, subprocess
+
+class TraceSupressor:
+    def __init__(self, args):
+        self.instr_thresh = 0
+        self.no_trace = []
+        self.do_trace = []
+        self.verbose = False
+        def val(arg): return arg.split('=')[-1]
+        def lines(file): return file, open(file).read().strip().split()
+        for arg in args:
+            if arg.startswith('-funtrace-instr-thresh='):
+                self.instr_thresh = int(val(arg))
+            elif arg.startswith('-funtrace-no-trace='):
+                self.no_file, self.no_trace = lines(val(arg))
+            elif arg.startswith('-funtrace-do-trace='):
+                self.do_file, self.do_trace = lines(val(arg))
+            elif arg == '-funtrace-verbose':
+                self.verbose = True
+
+    def suppress(self, funcname, num_instr):
+        if funcname in self.do_trace:
+            if self.verbose:
+                print(f'{funcname} listed in the do-trace file {self.do_file}')
+            return
+        reason = None
+        if funcname in self.no_trace:
+            reason = f'{funcname} listed in the trace suppression file {self.no_file}'
+        elif num_instr < self.instr_thresh:
+            reason = f'{funcname} has {num_instr} instructions, less than -funtrace-instr-thresh={self.instr_thresh}'
+        if self.verbose:
+            print(reason)
+        return reason
+
+# note that we don't support filtering XRay's output, in part on the theory that it already has
+# -fxray-instruction-threshold=N; to support it, we'd need to look for the NOPs it inserts - it doesn't
+# put in call instructions, that's done by runtime code patching
+hooks = [
+    '__cyg_profile_func_enter',
+    '__cyg_profile_func_exit',
+    '__fentry__',
+    '__return__',
+]
+
+def filter_asm(asm_file, suppressor):
+    with open(asm_file) as f:
+        lines = f.read().split('\n')
+
+    funcname = None
+    infunc = False
+    instrs = 0
+    funcstart = None
+
+    changed = False
+
+    for i,line in enumerate(lines):
+        l = line.strip()
+        if l.startswith('.type') and l.endswith('@function'):
+            funcname = l.split(',')[0].split()[-1]
+        elif l == '.cfi_startproc':
+            #print('in func',funcname)
+            infunc = True
+            funcstart = i+1
+            instrs = 0
+        elif l == '.cfi_endproc':
+            #print('end func', instrs)
+            infunc = False
+            suppression_reason = suppressor.suppress(funcname, instrs)
+            if not suppression_reason:
+                continue
+            
+            for j in range(funcstart, i):
+                l = lines[j].strip()
+                if l.startswith('call'):
+                    for hook in hooks:
+                        if hook in l:
+                            lines[j] = '# ' + lines[j] + ' # ' + suppression_reason
+                            changed = True
+                            break
+        elif infunc:
+            isinstr = l and line[0].isspace() and not l.startswith('.') and not l.endswith(':')
+            if isinstr:
+                instrs += 1
+
+    if changed:
+        with open(asm_file, 'w') as f:
+            f.write('\n'.join(lines))
+
+def exec_compiler(cmd, execl=True):
+    compiler = cmd[0]
+    if not os.path.exists(compiler):
+        compiler = subprocess.getoutput(f'which {compiler}')
+    if execl:
+        os.execl(compiler, *cmd)
+    else:
+        subprocess.run([compiler]+cmd[1:])
+
+def compile_filter_and_assemble(cmd, funtrace_args):
+    suppressor = TraceSupressor(funtrace_args)
+    compile_to_asm_cmd, assemble_cmd, asm_file = compile_and_assemble_commands(cmd)
+
+    #print(' '.join(compile_to_asm_cmd))
+    exec_compiler(compile_to_asm_cmd, execl=False)
+
+    filter_asm(asm_file, suppressor)
+
+    #print(' '.join(assemble_cmd))
+    exec_compiler(assemble_cmd, execl=False)
+
+def compile_and_assemble_commands(cmd):
+    ofile = None
+    cfile = None
+    sfile = None
+
+    def is_src_arg(arg):
+        return not arg.startswith('-') and (arg.endswith('.cpp') or arg.endswith('.c'))
+
+    for i,arg in enumerate(cmd):
+        if arg == '-o' and i+1 < len(cmd):
+            ofile = cmd[i+1]
+            sfile = ofile+'.s'
+        elif is_src_arg(arg):
+            cfile = arg
+
+    if cfile:
+        if not ofile:
+            ofile = cfile[:cfile.rfind('.')] + '.o'
+            sfile = cfile[:cfile.rfind('.')] + '.s'
+            compile_to_asm_cmd = [('-S' if arg == '-c' else arg) for arg in cmd] + ['-o',sfile]
+            assemble_cmd = [(sfile if is_src_arg(arg) else arg) for arg in cmd] + ['-o',ofile]
+        else:
+            compile_to_asm_cmd = [('-S' if arg == '-c' else (sfile if arg == ofile else arg)) for arg in cmd]
+            assemble_cmd = [(sfile if is_src_arg(arg) else arg) for arg in cmd]
+    else:
+        print(f'funtrace++ - WARNING: -c passed but could not determine the input source file in `{cmd}`')
+        exec_compiler(cmd)
+
+    if 'clang' in cmd[0]:
+        assemble_cmd += ['-Wno-unused-command-line-argument'] # when assembling a lot of compilation arguments become "unused" and clang warns about
+        assemble_cmd += ['-Wa,-W'] # clang produces assembly using MD5 sums for some source files but not others and then the assembler warns of
+        # "inconsistent use of md5 sums", not sure how to suppress this better...
+
+    return compile_to_asm_cmd, assemble_cmd, sfile
+
+def main():
+    cmd = sys.argv[1:]
+    funtrace_args = [arg for arg in cmd if arg.startswith('-funtrace-')]
+    cmd = [arg for arg in cmd if not arg.startswith('-funtrace-')]
+    if '-c' in cmd:
+        compile_filter_and_assemble(cmd, funtrace_args)
+    else:
+        exec_compiler(cmd)
+
+if __name__ == '__main__':
+    main()
