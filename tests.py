@@ -264,7 +264,9 @@ killed_main_ref = fn('main', fn('g', fn('f')))
 killed_children_ref = fn('g', fn('f'))
 
 # short_function and long_but_blacklisted should be filtered out
-asm_filter_ref = fn('short_but_whitelisted') + fn('long_enough_function')
+asm_filter_ref = fn('short_but_whitelisted') + fn('long_enough_function') + fn('short_with_loop')
+# another build for the same code - without the whitelist & blacklist and with loops ignored
+asm_filter_2_ref = fn('long_enough_function') + fn('long_but_blacklisted')
 
 freq_ref = [
     (call,'usleep_1500'),
@@ -470,6 +472,7 @@ def main():
     buildcmds('sigtrap.cpp')
     buildcmds('ftrace.cpp')
     buildcmds('asm_filter.cpp',flags=f'-funtrace-instr-thresh=20 -funtrace-no-trace={os.path.realpath("tests/no-trace.txt")} -funtrace-do-trace={os.path.realpath("tests/do-trace.txt")}')
+    buildcmds('asm_filter_2.cpp',flags=f'-funtrace-instr-thresh=20 -funtrace-ignore-loops')
     buildcmds('shared.cpp',shared=['lib_shared.cpp'],dyn_shared=['lib_dyn_shared.cpp'])
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
     pool.map(run_cmds, cmdlists)

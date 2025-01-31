@@ -46,6 +46,11 @@ void NI long_but_blacklisted()
     short_function();
 }
 
+void NI short_with_loop()
+{
+    while(!n);
+}
+
 int main()
 {
     scope_tracer tracer;
@@ -54,4 +59,5 @@ int main()
     short_but_whitelisted();
     long_enough_function();
     long_but_blacklisted();
+    short_with_loop();
 }

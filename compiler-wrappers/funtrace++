@@ -1,12 +1,13 @@
 #!/usr/bin/python3
 '''
-usage: funtrace++ </path/to/clang++ or g++> [-funtrace-instr-thresh=N] [-funtrace-no-trace=<mangled-names-list-file>] [-funtrace-do-trace=<names-file>] <compiler command>
+usage: funtrace++ </path/to/clang++ or g++> [-funtrace-instr-thresh=N] [-funtrace-no-trace=<mangled-names-list-file>] [-funtrace-do-trace=<names-file>] [-funtrace-ignore-loops] <compiler command>
 '''
 import os, sys, subprocess
 
 class TraceSupressor:
     def __init__(self, args):
         self.instr_thresh = 0
+        self.ignore_loops = False
         self.no_trace = []
         self.do_trace = []
         self.verbose = False
@@ -19,10 +20,12 @@ class TraceSupressor:
                 self.no_file, self.no_trace = lines(val(arg))
             elif arg.startswith('-funtrace-do-trace='):
                 self.do_file, self.do_trace = lines(val(arg))
+            elif arg == '-funtrace-ignore-loops':
+                self.ignore_loops = True
             elif arg == '-funtrace-verbose':
                 self.verbose = True
 
-    def suppress(self, funcname, num_instr):
+    def suppress(self, funcname, num_instr, loops):
         if funcname in self.do_trace:
             if self.verbose:
                 print(f'{funcname} listed in the do-trace file {self.do_file}')
@@ -31,7 +34,10 @@ class TraceSupressor:
         if funcname in self.no_trace:
             reason = f'{funcname} listed in the trace suppression file {self.no_file}'
         elif num_instr < self.instr_thresh:
-            reason = f'{funcname} has {num_instr} instructions, less than -funtrace-instr-thresh={self.instr_thresh}'
+            if not loops:
+                reason = f'{funcname} has {num_instr} instructions, less than -funtrace-instr-thresh={self.instr_thresh}'
+            elif self.ignore_loops:
+                reason = f'{funcname} has {num_instr} instructions, less than -funtrace-instr-thresh={self.instr_thresh}; it has {loops} loops but -funtrace-ignore-loops was passed'
         if self.verbose and reason:
             print(reason)
         return reason
@@ -53,6 +59,8 @@ def filter_asm(asm_file, suppressor):
     funcname = None
     infunc = False
     instrs = 0
+    loops = 0
+    labels = []
     funcstart = None
 
     changed = False
@@ -66,10 +74,12 @@ def filter_asm(asm_file, suppressor):
             infunc = True
             funcstart = i+1
             instrs = 0
+            loops = 0
+            labels = []
         elif l == '.cfi_endproc':
-            #print('end func', instrs)
+            #print('end func', funcname, instrs, loops)
             infunc = False
-            suppression_reason = suppressor.suppress(funcname, instrs)
+            suppression_reason = suppressor.suppress(funcname, instrs, loops)
             if not suppression_reason:
                 continue
             
@@ -84,9 +94,18 @@ def filter_asm(asm_file, suppressor):
                             changed = True
                             break
         elif infunc:
-            isinstr = l and line[0].isspace() and not l.startswith('.') and not l.endswith(':')
+            if not l:
+                continue
+            t = l.split()[0]
+            isinstr = line[0].isspace() and not t.startswith('.') and not t.endswith(':')
             if isinstr:
                 instrs += 1
+                for label in labels:
+                    if label in l:
+                        loops += 1
+                        break
+            elif t.startswith('.') and t.endswith(':'):
+                labels.append(t[:-1])
 
     if changed:
         with open(asm_file, 'w') as f:
@@ -145,6 +164,9 @@ def compile_and_assemble_commands(cmd):
         exec_compiler(cmd)
 
     assemble_cmd = [cmd[0], '-c', sfile, '-o', ofile]
+    if 'clang' in cmd[0]:
+        assemble_cmd += ['-Wa,-W'] # clang produces assembly using MD5 sums for some source files but not others and then the assembler warns of
+        # "inconsistent use of md5 sums", not sure how to suppress this better...
 
     return compile_to_asm_cmd, assemble_cmd, sfile
 
