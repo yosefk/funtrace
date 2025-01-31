@@ -16,6 +16,9 @@ if linking:
     is_shared = '-shared' in args
     if not is_shared: # don't link the runtime into .so's - only into the executables using them
         args += [os.path.join(srcdir, f) for f in ['funtrace.cpp']] + [f'-Wl,--dynamic-list={srcdir}/funtrace.dyn']
+    else:
+        # remove no-undefined for access to the funtrace_* runtime functions
+        args = [a for a in args if a != '-Wl,--no-undefined']
     args += ['-ldl']
 
 funtracexx = os.path.join(srcdir, 'compiler-wrappers/funtrace++')
