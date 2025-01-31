@@ -161,7 +161,7 @@ There are thus several ways to ask to include or exclude a function from tracing
   * Otherwise, a function on the list passed to -funtrace-no-trace is excluded, and so are function calls inlined into it
   * Otherwise, a function with less than N instructions where N was defined with -funtrace-instr-thresh=N and has no loops is excluded, and so are function calls inlined into it. If it has loops but -funtrace-ignore-loops was passed, it is also excluded, and so are function calls inlined into it.
  
-# Disabling & enabling tracing
+## Disabling & enabling tracing
 
 * `funtrace_ignore_this_thread()` excludes the calling thread from tracing "forever" (there's currently no way to undo this)
 * `funtrace_disable_tracing()` disables tracing globally (note that taking a snapshot effectively does the same thing until the snapshot is ready)
@@ -169,13 +169,14 @@ There are thus several ways to ask to include or exclude a function from tracing
 
 Additionally, compiling with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0 or setting $FUNTRACE_FTRACE_EVENTS_IN_BUF to 0 at runtime effectively disables ftrace scheduling event tracing, as mentioned again in the next section.
 
-# Controlling buffer sizes & lifetimes
+## Controlling buffer sizes & lifetimes
 
-* `funtrace_set_thread_log_buf_size(log_buf_size)`
-** FUNTRACE_LOG_BUF_SIZE
-** FUNTRACE_FTRACE_EVENTS_IN_BUF
-** FUNTRACE_GC_PERIOD_MS
-** FUNTRACE_GC_MAX_AGE_MS
+* `funtrace_set_thread_log_buf_size(log_buf_size)` sets the trace buffer size of the calling thread to `pow(2, log_buf_size)`. Passing 0 (or a value smaller than log(size of 2 trace entries), so currently 5) is equivalent to calling `funtrace_ignore_this_thread()`
+* The following parameters can be controlled by passing `-DNAME=VALUE` to the compiler (the command line equivalent of `#define NAME VALUE`), and/or reconfigured at runtime by setting the environment variable `$NAME` to `VALUE`:
+  * `FUNTRACE_LOG_BUF_SIZE`: each thread starts with a thread-local trace buffer of this size (the default is 20, meaning 1M bytes = 32K trace entries ~= 16K most recent function calls.) This initial buffer size can then be changed using `funtrace_set_thread_log_buf_size()`
+  * `FUNTRACE_FTRACE_EVENTS_IN_BUF`: the number of entries in this process's userspace ftrace buffer (the default is 20000; the size in bytes can vary since each entry keeps one line of textual ftrace data.) Passing `-DFUNTRACE_FTRACE_EVENTS_IN_BUF=0` disables ftrace at compile time - this **cannot** be changed by setting the env var at runtime to a non-zero value.
+  * `FUNTRACE_GC_MAX_AGE_MS`: when set to 0, a thread's thread-local trace buffer is freed upon thread exit - which means the trace data will be missing from future snapshots, even though the events in that buffer might have been recorded during the time range covered by the snapshot. When set to a non-zero value (default: 300 ms), thread trace buffers are kept after thread exit, and garbage-collected every FUNTRACE_GC_PERIOD_MS (see below); only buffers with age exceeding FUNTRACE_GC_MAX_AGE_MS are freed. Passing `-DFUNTRACE_GC_MAX_AGE_MS` disables garbage collection at compile time - this **cannot** be changed by setting the env var at runtime to a non-zero value.
+  * `FUNTRACE_GC_PERIOD_MS`: unless compiled out by #defining FUNTRACE_GC_MAX_AGE_MS to 0, the thread trace buffer garbage collection runs every FUNTRACE_GC_PERIOD_MS ms (default: the compile-time value of FUNTRACE_GC_MAX_AGE_MS.)
 
 # Limitations
 
