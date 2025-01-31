@@ -41,7 +41,11 @@ cd funtrace
 ```
 
 This is actually 4 different instrumented builds - 2 with gcc and 2 with clang; funtrace supports 2 different instrumentation methods for each compiler,
-and we'll discuss below how to choose the best method for you. You can view the traces produced from the simple example above as follows:
+and we'll discuss below how to choose the best method for you.
+
+Note that you might see the error message "**WARNING: funtrace - error initializing ftrace** (...), compile with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0 or run under `env FUNTRACE_FTRACE_EVENTS_IN_BUF=0` if you don't want to collect ftrace / see this warning". You can ignore this message, or disable ftrace as described in the message, or you can try making ftrace work - it's useful for seeing when threads are running vs waiting. Outside containers, the problem is usually permissions, and one way to make ftrace usable permissions-wise is **`sudo chown -R $USER /sys/kernel/tracing`**. Inside containers, things are more involved, and you might want to consult a human or a machine knowing more about it than this guide.
+
+You can view the traces produced from the simple example above as follows:
 
 ```
 pip install viztracer
@@ -64,8 +68,12 @@ they make trying funtrace easy; if you decide to use funtrace in your program, h
 compiler wrappers.
 
 Once the program compiles, you can run it as usual, and then `killall -SIGTRAP your-program` (or `kill -SIGTRAP <pid>`) when you want to get a trace. The trace will go to `funtrace.raw`; if you use SIGTRAP multiple times, many
-trace samples will be written to the file. Now you can run `funtrace2viz` the way `simple-example/run.sh` does; you should have it compiled if you ran `simple-example/build.sh` or just `cargo build` (the trace decoder is a Rust
-program.) funtrace2viz will produce a vizviewer JSON file from each trace sample in funtrace.raw, and you can open each JSON file in vizviewer.
+trace samples will be written to the file. Now you can run `funtrace2viz` the way `simple-example/run.sh` does; you should have it compiled if you ran `simple-example/build.sh` - or you could run `RUSTFLAGS="-C target-feature=+crt-static" cargo build -r --target x86_64-unknown-linux-gnu` (the trace decoder is a Rust program; this command compiles it into a static binary with no dependence on any shared libraries.) funtrace2viz will produce a vizviewer JSON file from each trace sample in funtrace.raw, and you can open each JSON file in vizviewer.
+
+Troubleshooting for first-time vizviewer issues:
+
+* If you see **`Error: RPC framing error`** in the browser tab opened by vizviewer, **reopen the JSON from the web UI**. (Note that you want to run vizviewer on every new JSON file, _even if_ it gives you "RPC framing error" when you do it - you _don't_ want to just open the JSON from the web UI since then you won't see source code!)
+* If **the timeline looks empty**, it's likely due to some mostly-idle threads having very old events causing the timeline to zoom out too much. (You can simply open the JSON with `less` or whatever - there's a line per function call; if the JSON doesn't look empty, funtrace is working.) **Try passing `--max-event-age` or `--oldest-event-time` to funtrace2viz**; it prints the time range of events recorded for each thread in each trace sample (by default, the oldest event in every sample gets the timestamp 0) and you can use these printouts to decide on the value of the flags. In the next section we'll discuss how to take snapshots at the time you want, of the time range you want, so that you needn't fiddle with flags this way.
 
 If you build the program, run it, and decode its trace on the same machine/in the same container, life is easy. If not, note that in order for funtrace2viz to work, you need the program and its shared libraries to be accessible at the paths where they were loaded from _in the traced program run_, on the machine _where funtrace2viz runs_. And to see the source code of the functions (as opposed to just function names), you need the source files to be accessible on that
 machine, at the paths _where they were when the program was built_. If this is not the case, you can remap the paths using a file called `substitute-path.json` in the current directory of funtrace2viz, as described below.
@@ -77,6 +85,53 @@ tracing is on by default.
 **TODO** binary releases of the decoding tools
 
 The above is how you can give funtrace a quick try. The rest tells how to integrate it in your program "for real."
+
+# Runtime API for taking & saving trace snapshots
+
+The next thing after trying funtrace with SIGTRAP is probably using the runtime API to take snapshots of interesting time ranges. (Eventually you'll want proper build system integration - but you probably want to "play some more" beforehand, and since snapshots taken with SIGTRAP aren't taken at "the really interesting times" and capture too much, you'll want to see better snapshots.)
+
+The recommended method for taking & saving snapshots is:
+
+* using `funtrace_time()` to find unusually high latency in every flow you care about
+* ...then use `funtrace_pause_and_get_snapshot_starting_at_time()` to capture snapshots when a high latency is observed
+* ...finally, use `funtrace_write_snapshot()` when you want to save the snapshot(s) taken upon the highest latencies
+
+In code, it looks something like this:
+
+```c++
+#include "funtrace.h"
+
+void Server::handleRequest() {
+  uint64_t start_time = funtrace_time();
+
+  doStuff();
+
+  uint64_t latency = funtrace_time() - start_time;
+  if(latency > _slowest) {
+    funtrace_free_snapshot(_snapshot);
+    _snapshot = funtrace_pause_and_get_snapshot_starting_at_time(start_time);
+    _slowest = latency;
+  }
+}
+
+Server::~Server() {
+  funtrace_write_snapshot("funtrace-request.raw", _snapshot);
+  funtrace_free_snapshot(_snapshot);
+}
+```
+
+There's also `funtrace_pause_and_get_snapshot_up_to_age(max_event_age)` - very similar to `funtrace_pause_and_get_snapshot_starting_at_time(start_time)`; and if you want the full content of the trace buffers without an event age limit, there's `funtrace_pause_and_get_snapshot()`. And you can write the snapshot straight from the threads' trace buffers to a file, without allocating memory for a snapshot, using `funtrace_pause_and_write_current_snapshot()` (this is exactly what the SIGTRAP handler does.)
+
+As implied by their names, **all of these functions pause tracing until they're done** (so that traced events aren't overwritten with new events before we have the chance to save them.) This means that, for example, a concurrent server where `Server::handleRequest()` is called from multiple threads might have a gap in one of the snapshots taken by 2 threads at about the same time; hopefully, unusual latency in 2 threads at the same time is rare, and even if does happen, you'll get at least one good snapshot.
+
+All of the snapshot-saving functions write to files; an interface for sending the data to some arbitrary stream could be added given demand.
+
+Finally, a note on the time functions:
+
+* `funtrace_time()` is a thin wrapper around `__rdtsc()` so you needn't worry about its cost
+* `funtrace_ticks_per_second()` gives you the TSC frequency in case you want to convert timestamps or time diffs to seconds/ns
+
+# Decoding traces
 
 # Choosing compiler instrumentation
 
@@ -133,11 +188,7 @@ The short story is, **choose an instrumentation method and then compile in the w
   * `clang++ -finstrument-functions-after-inlining` - you can instead pass -finstrument-functions to instrument before inlining
   * `-fxray-instruction-threshold=...` is _not_ passed by the XRay wrapper - you can set your own threshold
  
-**TODO** document funtrace++
-  
-# Runtime API for taking & saving trace snapshots
-
-# Decoding traces
+All the compiler wrappers execute `compiler-wrappers/funtrace++`, itself a compiler wrapper which implements a few flags - `-funtrace-instr-thresh=N`, `-funtrace-ignore-loops`, `-funtrace-do-trace=file`, and `-funtrace-no-trace=file` - for controlling which function get traced, by changing the assembly code produced by the compiler. If you don't need any of these flags, you needn't prefix your compilation command with `funtrace++` like the wrappers do. (Funtrace needn't touch the code generated by the compiler for any reason other than supporting these flags.)
 
 # Compile-time & runtime configuration
 
