@@ -11,8 +11,7 @@ than the fairly low-frequency sampling of the current callstack a-la perf. What 
 the overhead, by disabling tracing of short functions called very often)? Unlike flamegraphs showing where the program spends its time on average,
 traces let you **debug cases of unusually high latency**, including in production (and it's a great idea to collect traces in production, and not just during development!)
 
-For a long read about why tracing profilers are useful and how funtrace works, see [Profiling in production with function call traces](https://yosefk.com/blog/profiling-in-production-with-function-call-traces.html).
-What follows is a shorter funtrace user guide.
+If you're interested in why tracing profilers are useful and how funtrace works, see [Profiling in production with function call traces](https://yosefk.com/blog/profiling-in-production-with-function-call-traces.html). What follows is a funtrace user guide.
 
 # Why funtrace?
 
@@ -41,9 +40,14 @@ cd funtrace
 ```
 
 This is actually 4 different instrumented builds - 2 with gcc and 2 with clang; funtrace supports 2 different instrumentation methods for each compiler,
-and we'll discuss below how to choose the best method for you.
+and we'll discuss below how to choose the best method for you. Note that you might see the error message: 
 
-Note that you might see the error message "**WARNING: funtrace - error initializing ftrace** (...), compile with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0 or run under `env FUNTRACE_FTRACE_EVENTS_IN_BUF=0` if you don't want to collect ftrace / see this warning". You can ignore this message, or disable ftrace as described in the message, or you can try making ftrace work - it's useful for seeing when threads are running vs waiting. Outside containers, the problem is usually permissions, and one way to make ftrace usable permissions-wise is **`sudo chown -R $USER /sys/kernel/tracing`**. Inside containers, things are more involved, and you might want to consult a human or a machine knowing more about it than this guide.
+```
+WARNING: funtrace - error initializing ftrace** (...), compile with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0
+  or run under `env FUNTRACE_FTRACE_EVENTS_IN_BUF=0` if you don't want to collect ftrace / see this warning
+```
+
+ You can ignore this message, or disable ftrace as described in the message, or you can try making ftrace work - it's useful for seeing when threads are running vs waiting. The problem is usually permissions, and one way to make ftrace usable permissions-wise is **`sudo chown -R $USER /sys/kernel/tracing`**. Inside containers, things are more involved, and you might want to consult a human or a machine knowing more about it than this guide.
 
 You can view the traces produced from the simple example above as follows:
 
@@ -70,7 +74,7 @@ compiler wrappers.
 Once the program compiles, you can run it as usual, and then `killall -SIGTRAP your-program` (or `kill -SIGTRAP <pid>`) when you want to get a trace. The trace will go to `funtrace.raw`; if you use SIGTRAP multiple times, many
 trace samples will be written to the file. Now you can run `funtrace2viz` the way `simple-example/run.sh` does; you should have it compiled if you ran `simple-example/build.sh` - or you could run `RUSTFLAGS="-C target-feature=+crt-static" cargo build -r --target x86_64-unknown-linux-gnu` (the trace decoder is a Rust program; this command compiles it into a static binary with no dependence on any shared libraries.) funtrace2viz will produce a vizviewer JSON file from each trace sample in funtrace.raw, and you can open each JSON file in vizviewer.
 
-Troubleshooting for first-time vizviewer issues:
+Troubleshooting vizviewer issues:
 
 * If you see **`Error: RPC framing error`** in the browser tab opened by vizviewer, **reopen the JSON from the web UI**. (Note that you want to run vizviewer on every new JSON file, _even if_ it gives you "RPC framing error" when you do it - you _don't_ want to just open the JSON from the web UI since then you won't see source code!)
 * If **the timeline looks empty**, it's likely due to some mostly-idle threads having very old events causing the timeline to zoom out too much. (You can simply open the JSON with `less` or whatever - there's a line per function call; if the JSON doesn't look empty, funtrace is working.) **Try passing `--max-event-age` or `--oldest-event-time` to funtrace2viz**; it prints the time range of events recorded for each thread in each trace sample (by default, the oldest event in every sample gets the timestamp 0) and you can use these printouts to decide on the value of the flags. In the next section we'll discuss how to take snapshots at the time you want, of the time range you want, so that you needn't fiddle with flags this way.
@@ -131,9 +135,25 @@ Finally, a note on the time functions:
 * `funtrace_time()` is a thin wrapper around `__rdtsc()` so you needn't worry about its cost
 * `funtrace_ticks_per_second()` gives you the TSC frequency in case you want to convert timestamps or time diffs to seconds/ns
 
-# Decoding traces
+# "Coretime API" for saving trace snapshots
+
+While we're on the subject of snapshots - you can get trace data from a core dump by loading `funtrace_gdb.py` from gdb - by running `gdb -x funtrace_gdb.py`, or using the gdb command `python execfile("funtrace_gdb.py")`, or somewhere in `.gdbinit`. Then you'll get the extension command `funtrace` which works something like this:
+
+```
+(gdb) funtrace
+funtrace: saving proc mappings
+funtrace: core dump generated by `your-program arg1 arg2`
+funtrace: thread 1287700 your-program - saving 1048576 bytes of data read from 0x7fb199c00000
+funtrace: thread 1287716 child - saving 1048576 bytes of data read from 0x7fb17c200000
+funtrace: saving 22 ftrace events
+funtrace: done - decode with `funtrace2viz funtrace.raw out` and then view in viztracer (pip install viztracer) with `vizviewer out.json`
+```
+
+Basically it's what SIGTRAP would save to `funtrace.raw`, had it been called right when the core was dumped. Can be very useful to see what the program was doing right before it crashed.
 
 # Choosing compiler instrumentation
+
+Once you have snapshots of the right time ranges, you might want to settle on a particular compiler instrumentation method. For that, the below can be helpful as well as the next section, which talks about culling overhead with the `funcount` tool (one thing which will help you choose the instrumentation method is how much overhead it adds, which differs between programs, and funcount can help estimate that overhead.)
 
 Funtrace relies on the compiler inserting hooks upon function calls and returns. Funtrace supports 4 instrumentation methods (2 for gcc and 2 for clang), and comes with a compiler wrapper script passing the right flags to use each:
 
@@ -190,6 +210,10 @@ The short story is, **choose an instrumentation method and then compile in the w
  
 All the compiler wrappers execute `compiler-wrappers/funtrace++`, itself a compiler wrapper which implements a few flags - `-funtrace-instr-thresh=N`, `-funtrace-ignore-loops`, `-funtrace-do-trace=file`, and `-funtrace-no-trace=file` - for controlling which function get traced, by changing the assembly code produced by the compiler. If you don't need any of these flags, you needn't prefix your compilation command with `funtrace++` like the wrappers do. (Funtrace needn't touch the code generated by the compiler for any reason other than supporting these flags.)
 
+# Culling overhead with `funcount`
+
+# Decoding traces
+
 # Compile-time & runtime configuration
 
 ## Controlling which functions are traced
@@ -245,3 +269,5 @@ Additionally, compiling with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0 or setting $FUNTR
 * **Untraced exception catcher artifacts** with some instrumentation methods, as documented in the section "Choosing compiler instrumentation." A related but likely extremely rare artifact you might see with these instrumentation methods is mixing recursion and exception handling where you have a recursive function that doesn't catch an exception at the innermost recursion level but then does catch it at another level - funtrace trace analysis will incorrectly assume the exception was caught at the innermost level (unless `gcc -finstrument-functions` was used, which calls the on-return hook when unwinding the stack and doesn't require guesswork at trace analysis time.)
 * **Unloading traced shared libraries within the time range of a snapshot is unsupported** - a trace snapshot contains an address space snapshot made at the end of the time range, so if a shared library was unloaded, functions traced from it will not be decodable in the trace; reusing the executable address space for new addresses will mess up decoding further. A need to dlclose libraries midway thru the tracing is probably extremely rare.
 * **Mixing instrumentation methods in the same build or process wasn't tested** and might not work for various reasons; this feels like a fairly esoteric need, but can almost certainly be made to work given demand.
+
+# Funtrace file format
