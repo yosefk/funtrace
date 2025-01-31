@@ -147,10 +147,10 @@ Control at function granularity is only available at build time, as follows:
   * `NOFUNTRACE` - a function attribute excluding a function from tracing (eg `void NOFUNTRACE func()` - this is the `__attribute__((...))` syntax of gcc/clang).
   * `DOFUNTRACE` - a function attribute forcing the inclusion of a function in tracing - currently only meaningful for XRay, which might otherwise exclude functions due to the `-fxray-instruction-threshold=N` flag
 * **Assembly filtering flags**: if you use the `funtrace++` wrapper around g++/clang++ in your build system (which you'd want to do solely to get the flags below), you get the option to filter compiler-generated assembly code to exclude some functions from tracing; this is convenient with foreign code (eg functions in standard or external library header files) as well as "to cast a wide net" based on function length a-la XRay's `-fxray-instruction-threshold=N` (_note that assembly filtering is not supported with XRay_):
-* `-funtrace-do-trace=file` - the file should contain a list of whitespace-separated mangled function names, these functions will NOT excluded from tracing
-* `-funtrace-no-trace=file` - the file should contain a list of whitespace-separated mangled function names, these functions WILL be excluded from tracing
-* `-funtrace-instr-thresh=N` - functions with less than N instructions will be excluded from tracing together with function calls inlined into them, UNLESS they have loops
-* `-funtrace-ignore-loops` - if -funtrace-instr-thresh=N was passed, functions with less than N instructions will be excluded from tracing together with function calls inlined into them, EVEN IF they have loops
+  * `-funtrace-do-trace=file` - the file should contain a list of whitespace-separated mangled function names, these functions will NOT excluded from tracing
+  * `-funtrace-no-trace=file` - the file should contain a list of whitespace-separated mangled function names, these functions WILL be excluded from tracing
+  * `-funtrace-instr-thresh=N` - functions with less than N instructions will be excluded from tracing together with function calls inlined into them, UNLESS they have loops
+  * `-funtrace-ignore-loops` - if -funtrace-instr-thresh=N was passed, functions with less than N instructions will be excluded from tracing together with function calls inlined into them, EVEN IF they have loops
 
 There are thus several ways to ask to include or exclude a function from tracing; what happens if they conflict?
 
@@ -160,6 +160,22 @@ There are thus several ways to ask to include or exclude a function from tracing
   * A function on the list passed to -funtrace-do-trace is always kept
   * Otherwise, a function on the list passed to -funtrace-no-trace is excluded, and so are function calls inlined into it
   * Otherwise, a function with less than N instructions where N was defined with -funtrace-instr-thresh=N and has no loops is excluded, and so are function calls inlined into it. If it has loops but -funtrace-ignore-loops was passed, it is also excluded, and so are function calls inlined into it.
+ 
+# Disabling & enabling tracing
+
+* `funtrace_ignore_this_thread()` excludes the calling thread from tracing "forever" (there's currently no way to undo this)
+* `funtrace_disable_tracing()` disables tracing globally (note that taking a snapshot effectively does the same thing until the snapshot is ready)
+* `funtrace_enable_tracing()` (re-)enables the tracing globally (by default, tracing is on when the program starts so you needn't do it; "on by default" means you can get a trace from a core dump and from a live process with SIGTRAP without any tweaking to the program source)
+
+Additionally, compiling with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0 or setting $FUNTRACE_FTRACE_EVENTS_IN_BUF to 0 at runtime effectively disables ftrace scheduling event tracing, as mentioned again in the next section.
+
+# Controlling buffer sizes & lifetimes
+
+* `funtrace_set_thread_log_buf_size(log_buf_size)`
+** FUNTRACE_LOG_BUF_SIZE
+** FUNTRACE_FTRACE_EVENTS_IN_BUF
+** FUNTRACE_GC_PERIOD_MS
+** FUNTRACE_GC_MAX_AGE_MS
 
 # Limitations
 
