@@ -3,6 +3,11 @@
 
 volatile int n;
 
+extern "C" void NI trace_filtered()
+{
+    n=0;
+}
+
 void NI NOFUNTRACE notrace()
 {
     n=0;
@@ -46,6 +51,7 @@ inline uint64_t time(F f, const char* msg, uint64_t base=0)
 int main()
 {
     uint64_t base_cost = time(notrace, "compiled without tracing");
+    time(trace_filtered, "compiled with tracing, removed by asm filtering", base_cost);
     time(withtrace, "compiled with tracing, enabled at runtime", base_cost);
     funtrace_disable_tracing();
     time(withtrace, "compiled with tracing, disabled at runtime", base_cost);

@@ -464,7 +464,7 @@ def main():
     buildcmds('tailcall.cpp')
     buildcmds('orphans.cpp')
     buildcmds('buf_size.cpp')
-    buildcmds('benchmark.cpp')
+    buildcmds('benchmark.cpp',flags=f'-funtrace-no-trace={os.path.realpath("tests/no-trace-bench.txt")}')
     buildcmds('freq.cpp')
     buildcmds('killed.cpp')
     buildcmds('sigtrap.cpp')
