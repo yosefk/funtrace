@@ -3,23 +3,6 @@
 #ifdef FUNTRACE_FUNCOUNT
 #include "funcount.cpp"
 
-//provide empty implementations of the funtrace APIs so that you could use funcount
-//with a program calling funtrace APIs easily (and not just the first time you integrate the APIs)
-extern "C" {
-void funtrace_pause_and_write_current_snapshot() {}
-struct funtrace_snapshot* funtrace_pause_and_get_snapshot() { return nullptr; }
-uint64_t funtrace_time() { return __rdtsc(); }
-uint64_t funtrace_ticks_per_second() { return 1000000000; } //we shouldn't need this to be correct */
-struct funtrace_snapshot* funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time) { return nullptr; }
-struct funtrace_snapshot* funtrace_pause_and_get_snapshot_up_to_age(uint64_t max_event_age) { return nullptr; }
-void funtrace_free_snapshot(struct funtrace_snapshot* snapshot) {}
-void funtrace_write_snapshot(const char* filename, struct funtrace_snapshot* snapshot) {}
-void funtrace_ignore_this_thread() {}
-void funtrace_set_thread_log_buf_size(int log_buf_size) {}
-void funtrace_disable_tracing() {}
-void funtrace_enable_tracing() {}
-}
-
 #else 
 
 #include <x86intrin.h>
@@ -1069,11 +1052,7 @@ struct ftrace_handler
     NOINSTR ftrace_handler() {
         quit = false;
         done = false;
-        int events_in_buf = FUNTRACE_FTRACE_EVENTS_IN_BUF;
-        const char* env = getenv("FUNTRACE_FTRACE_EVENTS_IN_BUF");
-        if(env) {
-            events_in_buf = atoi(env);
-        }
+        int events_in_buf = env_int("FUNTRACE_FTRACE_EVENTS_IN_BUF", FUNTRACE_FTRACE_EVENTS_IN_BUF);
         if(!events_in_buf) {
             init_errors = true;
             return;
@@ -1123,8 +1102,8 @@ struct ftrace_handler
         if(init_errors) {
             return;
         }
-        printf("WARNING: funtrace - error initializing ftrace (%s - %s), compile with -DFUNTRACE_NO_FTRACE or "
-               "setenv FUNTRACE_NO_FTRACE at runtime if you don't want to collect ftrace / see this warning\n", what, strerror(errno));
+        printf("WARNING: funtrace - error initializing ftrace (%s - %s), compile with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0 or "
+               "run under `env FUNTRACE_FTRACE_EVENTS_IN_BUF=0` if you don't want to collect ftrace / see this warning\n", what, strerror(errno));
         init_errors = true;
     }
     void NOINSTR write_file(const char* file, const char* contents)

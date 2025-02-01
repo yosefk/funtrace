@@ -252,3 +252,21 @@ extern "C" void* NOINSTR dlmopen(Lmid_t lmid, const char *filename, int flags)
     allocate_page_tables();
     return lib;
 }
+
+//provide empty implementations of the funtrace APIs so that you could use funcount
+//with a program calling funtrace APIs easily (and not just the first time you integrate the APIs)
+extern "C" {
+void funtrace_pause_and_write_current_snapshot() {}
+struct funtrace_snapshot* funtrace_pause_and_get_snapshot() { return nullptr; }
+uint64_t funtrace_time() { return __rdtsc(); }
+uint64_t funtrace_ticks_per_second() { return 1000000000; } //we shouldn't need this to be correct */
+struct funtrace_snapshot* funtrace_pause_and_get_snapshot_starting_at_time(uint64_t time) { return nullptr; }
+struct funtrace_snapshot* funtrace_pause_and_get_snapshot_up_to_age(uint64_t max_event_age) { return nullptr; }
+void funtrace_free_snapshot(struct funtrace_snapshot* snapshot) {}
+void funtrace_write_snapshot(const char* filename, struct funtrace_snapshot* snapshot) {}
+void funtrace_ignore_this_thread() {}
+void funtrace_set_thread_log_buf_size(int log_buf_size) {}
+void funtrace_disable_tracing() {}
+void funtrace_enable_tracing() {}
+}
+
