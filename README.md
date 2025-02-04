@@ -10,6 +10,21 @@ Unlike a sampling profiler such as perf, **a tracing profiler must be told what 
 
 If you're interested in why tracing profilers are useful and how funtrace works, see [Profiling in production with function call traces](https://yosefk.com/blog/profiling-in-production-with-function-call-traces.html). What follows is a funtrace user guide.
 
+- [Why funtrace?](#why-funtrace)
+- [Trying funtrace](#trying-funtrace)
+- [Runtime API for taking & saving trace snapshots](#runtime-api-for-taking--saving-trace-snapshots)
+- ["Coretime" API for saving trace snapshots](#coretime-api-for-saving-trace-snapshots)
+- [Choosing a compiler instrumentation method](#choosing-a-compiler-instrumentation-method)
+- [Integrating funtrace into your build system](#integrating-funtrace-into-your-build-system)
+- [Culling overhead with `funcount`](#culling-overhead-with-funcount)
+- [Decoding traces](#decoding-traces)
+- [Compile time & runtime configuration](#compile-time--runtime-configuration)
+  - [Controlling which functions are traced](#controlling-which-functions-are-traced)
+  - [Disabling & enabling tracing](#disabling--enabling-tracing)
+  - [Controlling buffer sizes & lifetimes](#controlling-buffer-sizes--lifetimes)
+- [Limitations](#limitations)
+- [Funtrace file format](#funtrace-file-format)
+
 # Why funtrace?
 
 * **Low overhead tracing** (FWIW, in my microbenchmark I get <10 ns per instrumented call or return -
