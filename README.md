@@ -27,7 +27,7 @@ If you're interested in why tracing profilers are useful and how funtrace works,
 
 # Trying funtrace
 
-You can clone the repo & build the trace decoder (or uinzip a binary release), compile & run a simple example program, and decode its output traces as follows:
+You can clone the repo & build the trace decoder (or uinzip [a binary release](https://github.com/yosefk/funtrace/releases)), compile & run a simple example program, and decode its output traces as follows:
 
 ``` shell
 # clone the source...
