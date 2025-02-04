@@ -43,7 +43,7 @@ This is actually 4 different instrumented builds - 2 with gcc and 2 with clang; 
 and we'll discuss below how to choose the best method for you. Note that you might see the error message: 
 
 ```
-WARNING: funtrace - error initializing ftrace** (...), compile with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0
+WARNING: funtrace - error initializing ftrace (...), compile with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0
   or run under `env FUNTRACE_FTRACE_EVENTS_IN_BUF=0` if you don't want to collect ftrace / see this warning
 ```
 
@@ -212,6 +212,39 @@ All the compiler wrappers execute `compiler-wrappers/funtrace++`, itself a compi
 
 # Culling overhead with `funcount`
 
+If tracing slows down your program too much, you might want to exclude some functions from tracing. You can do this on some "wide basis", such as "no tracing inside this bunch of libraries, we do compile higher-level logic to trace the overall flow" or such. You can also use `-fxray-instruction-threshold` or `-funtrace-instr-thresh` to automatically exclude short functions without loops. But you might also want to do some "targeted filtering" where you find functions called very often, and exclude those (to save both cycles and space in the trace buffer - with many short calls, you need a much larger snapshot to see far enough into the past.)
+
+`funcount` is a tool for counting function calls, which is recommended for finding "frequent callees" to exclude from traces. Funcount is:
+
+* **Fast** (about as fast as funtrace and unlike the very slow callgrind)
+* **Accurate** (unlike perf which doesn't know how many time a function was called, only how many cycles were spent there and only approximately with its low frequenchy sampling)
+* **Thread-safe** (unlike gprof which produces garbage call counts with multithreaded programs)
+* **Small** (~300 LOC) and easy to port
+
+Finally, funcount **counts exactly the calls funtrace would trace** - nothing that's not traced is counted, and nothing that's traced is left uncounted.
+
+You enable funcount by passing `-DFUNTRACE_FUNCOUNT` on the command line (only `funtrace.cpp` needs this -D, you don't really need to recompile the whole program), or by compiling & linking `funcount.cpp` instead of `funtrace.cpp` into your program - whichever is easier in your build system. If the program runs much slower than with funtrace (which can be very slow if you instrument before inlining but otherwise is fairly fast), it must be multithreaded, with the threads running the same concurrently and fighting over the ownership of the cache lines containing the call counters maintained by funcount. You can compile with `-DFUNCOUNT_PAGE_TABLES=16` or whatever number to have each CPU core update its own copy of each call counter, getting more speed in exchange for space (not that much space - each page table is at worst the size of the executable sections, though on small machines this might matter.)
+
+At the end of the run, you will see the message:
+
+`function call count report saved to funcount.txt - decode with funcount2sym to get: call_count, dyn_addr, static_addr, num_bytes, bin_file, src_file, src_line, mangled_func_name`
+
+`funcount2sym funcount.txt` prints the columns described in the message to standard output; the most commonly interesting ones are highlighted in bold:
+
+* **`call_count` - the number of times the function was called**
+* `dyn_addr` - the dynamic address of the function as loaded into the process (eg what you'd see in `gdb`)
+* `static_addr` - the static address of the function in the binary file (what you'd see with `nm`)
+* `num_bytes` - the number of bytes making up the function, a proxy for how many instructions long it is
+* `bin_file` - the executable or shared library containing the function
+* **`src_file` - the source file where the function is defined**
+* **`src_line` - the source line number**
+* **`mangled_func_name` - the mangled function name**; you can pipe funcount2sym through `c++filt` to demangle it, though often you will want the mangled name
+
+You sort this report with `sort -nr` and add reports from multiple runs together with `awk`.
+
+
+
+
 # Decoding traces
 
 # Compile-time & runtime configuration
@@ -280,7 +313,7 @@ Funtrace data is binary, using little endian encoding for integers. It consists 
 * **`FUNTRACE`**: an 8-byte chunk indicating the start of a snapshot, with an 8-byte frequency of the timestamp counter, used to convert counter values into nanoseconds. A snapshot is interpreted according to the memory map reported by the last encountered `PROCMAPS` chunk (there may be many snapshots in the same file; currently the funtrace runtime saves a `PROCMAPS` chunk every time it takes a snapshot but if you know that your memory map remains stable over time and you want to shave off a little bit of latency, you could tweak this.)
 * **`CMD LINE`**: the process command line, used as the process name when generating the JSON. A wart worth mentioning is that currently, the funtrace runtime reads this from `/proc/self/cmdline` and replaces null characters separating the arguments with spaces, which means that the shell command `prog "aaa bbb"`, which passes a single string argument `aaa bbb`, will be saved as `prog aaa bbb` (two string arguments). So we save enough to help you see "the trace of what you're looking at" but not enough to eg use the saved command line for reproducing the run.
 * **`THREADID`**: a 64b PID integer, a 64b TID integer, and a null-terminated 16-byte name string (the content of `/proc/self/comm` aka the output of `pthread_getname_np(pthread_self(),...)`.) This precedes every `TRACEBUF` chunk (documented next.)
-* **`TRACEBUF`**: a variable sized chunk of length which is a multiple of 16. It contains trace entries; each entry is a 64b code pointer, and a 64b timestamp counter value. The entries are _not_ sorted by the timestamp, for 2 reasons - they come from a cyclic buffer, and the funtrace writeout code is racy, so you can have rare cases of `new_entry, old_entry, new_entry` near the end of the cyclic buffer because one of the newest entries didn't make it into the buffer so you got a much older entry. So you need to sort the entries for processing, and you need to "defend" against missing events (so you could see a return without a call or a call without a return; this is not just because of the raciness of the writeout but because the cyclic buffer ends before "the end of program execution" and starts after "the start of execution" and you can have various other niceties like longjmp. The code pointer can have the following flags set in its high bits:
+* **`TRACEBUF`**: a variable sized chunk of length which is a multiple of 16. It contains trace entries; each entry is a 64b code pointer, and a 64b timestamp counter value. The entries are _not_ sorted by the timestamp, for 2 reasons - they come from a cyclic buffer, and the funtrace writeout code is racy, so you can have rare cases of `new_entry, old_entry, new_entry` near the end of the cyclic buffer because one of the newest entries didn't make it into the buffer so you got a much older entry. So you need to sort the entries for processing, and you need to "defend" against missing events (meaning, you could see a return without a call or a call without a return; this is not just because of the raciness of the writeout but because the cyclic buffer ends before "the end of program execution" and starts after "the start of execution" and you can have various other niceties like longjmp.) The code pointer can have the following flags set in its high bits:
   * `RETURN` (63): a return event, where the code pointer points into the returning function
   * `RETURN_WITH_CALLER_ADDRESS` (62): a return event where the code pointer points _into the function we're returning to_. This unfortunate tracing artifact happens under XRay instrumentation; funtrace2viz mostly recovers the flow despite this. When this bit and the previous bit are both set, this is a `CATCH` event, and the code pointer points into the function that caught the exception.
   * `CALL_RETURNING_UPON_THROW` (61): marks call events that will have a return event logged for them if an exception is thrown. Under most instrumentation methods this does not happen and so funtrace2viz guesses which functions effectively returned during stack unwinding. When it sees a call entry with this flag set, it knows that this function wouldn't return without logging a return event even if an exception was thrown, which prevents it from wrongly guessing that the function returned due to unwinding.
