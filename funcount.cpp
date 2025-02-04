@@ -204,7 +204,7 @@ NOINSTR CountsPagesL2::~CountsPagesL2()
         }
     }
     if(this == last_page_tab) {
-        std::cout << "function call count report saved to funcount.txt" << std::endl;
+        std::cout << "function call count report saved to funcount.txt - decode with funcount2sym to get: call_count, dyn_addr, static_addr, num_bytes, bin_file, src_file:src_line, mangled_func_name" << std::endl;
     }
 }
 

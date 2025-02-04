@@ -191,6 +191,7 @@ pub struct SymInfo {
     //from the input address passed to proc_addr2sym()). like file:line, whenever
     //possible, this is the base address of the function, not the address
     //directly corresponding to the input dynamic address
+    pub size: u64, //0 if no symbol found
 }
 
 fn time2str(time: &SystemTime) -> String {
@@ -238,7 +239,7 @@ impl ProcAddr2Sym {
     }
 
     pub fn unknown_symbol(&self) -> SymInfo {
-        return SymInfo { func: "??".to_string(), demangled_func: "??".to_string(), file: "??".to_string(), line: 0, executable_file: "??".to_string(), static_addr: 0 };
+        return SymInfo { func: "??".to_string(), demangled_func: "??".to_string(), file: "??".to_string(), line: 0, executable_file: "??".to_string(), static_addr: 0, size: 0 };
     }
 
     pub fn proc_addr2sym(&mut self, proc_address: u64) -> SymInfo {
@@ -297,6 +298,7 @@ impl ProcAddr2Sym {
         }
         let vaddr_offset = self.offset_cache.get(&map.address.0).unwrap();
         let mut static_addr = proc_address - map.address.0 + vaddr_offset;
+        let mut size = 0;
 
         let mut name = "??".to_string();
         let mut demangled_func = "??".to_string();
@@ -306,6 +308,7 @@ impl ProcAddr2Sym {
             name_found = true;
             name = sym.name.clone();
             static_addr = sym.base_address;
+            size = sym.size; 
             if let Ok(demsym) = cpp_demangle::Symbol::new(name.clone()) {
                 demangled_func = demsym.to_string();
             }
@@ -367,6 +370,6 @@ impl ProcAddr2Sym {
                 }
             }
         }
-        SymInfo{func:strip_clone(name), demangled_func:strip_clone(demangled_func), file, line:linenum, executable_file:pathstr, static_addr}
+        SymInfo{func:strip_clone(name), demangled_func:strip_clone(demangled_func), file, line:linenum, executable_file:pathstr, static_addr, size}
     }
 }

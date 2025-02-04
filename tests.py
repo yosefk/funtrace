@@ -277,8 +277,8 @@ class funinfo:
     def __init__(self,line,t):
         self.line = line
         self.count = int(t[0])
-        self.module = t[3]
-        self.file, self.line = t[4].split(':')
+        self.module = t[4]
+        self.file, self.line = t[5].split(':')
 class symcount:
     def __init__(self, lines):
         self.lines = [(line,line.split()) for line in lines]

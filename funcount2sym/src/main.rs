@@ -58,7 +58,7 @@ fn main() {
 
         let syminfo = procaddr2sym.proc_addr2sym(address);
 
-        println!("{} {:#x} {:#x} {} {}:{} {}", count, address, syminfo.static_addr, syminfo.executable_file, syminfo.file, syminfo.line, syminfo.func);
+        println!("{} {:#x} {:#x} {} {} {}:{} {}", count, address, syminfo.static_addr, syminfo.size, syminfo.executable_file, syminfo.file, syminfo.line, syminfo.func);
 
         line.clear();
     }
