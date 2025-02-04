@@ -6,10 +6,7 @@ A function call tracer is a kind of profiler showing **a timeline of function ca
 
 Here we can see 2 threads - whether they're running or waiting, and the changes to their callstack over time - and the source code of a selected function.
 
-Unlike a sampling profiler such as perf, **a tracing profiler must be told what to trace** using some runtime API, and also has a **higher overhead**
-than the fairly low-frequency sampling of the current callstack a-la perf. What do you get in return for the hassle and the overhead (and the hassle of culling
-the overhead, by disabling tracing of short functions called very often)? Unlike flamegraphs showing where the program spends its time on average,
-traces let you **debug cases of unusually high latency**, including in production (and it's a great idea to collect traces in production, and not just during development!)
+Unlike a sampling profiler such as perf, **a tracing profiler must be told what to trace** using some runtime API, and also has a **higher overhead** than the fairly low-frequency sampling of the current callstack a-la perf. What do you get in return for the hassle and the overhead (and the hassle of culling the overhead, by disabling tracing of short functions called very often)? Unlike flamegraphs showing where the program spends its time on average, traces let you **debug cases of unusually high latency**, including in production (and it's a great idea to collect traces in production, and not just during development!)
 
 If you're interested in why tracing profilers are useful and how funtrace works, see [Profiling in production with function call traces](https://yosefk.com/blog/profiling-in-production-with-function-call-traces.html). What follows is a funtrace user guide.
 
@@ -30,24 +27,30 @@ If you're interested in why tracing profilers are useful and how funtrace works,
 
 # Trying funtrace
 
-You can clone the repo, build the trace decoder, compile & run a simple example program, and decode its output traces as follows:
+You can clone the repo & build the trace decoder (or uinzip a binary release), compile & run a simple example program, and decode its output traces as follows:
 
-```
+``` shell
+# clone the source...
 git clone https://github.com/yosefk/funtrace
+# ...or unzip a binary release
+unzip funtrace.zip
+
 cd funtrace
 ./simple-example/build.sh
 ./simple-example/run.sh
 ```
 
-This is actually 4 different instrumented builds - 2 with gcc and 2 with clang; funtrace supports 2 different instrumentation methods for each compiler,
-and we'll discuss below how to choose the best method for you. Note that you might see the error message: 
+This actually tests 4 different instrumented builds - 2 with gcc and 2 with clang; we'll discuss below how to choose the best method for you. Troubleshooting:
+
+* With an older clang, you'll get `clang: error: unknown argument: '-fxray-shared'` - in that case, you can use 3 instrumentation methods out of the 4.
+* You might have issues accessing ftrace data. This is not a problem for _function tracing_ but it prevents _thread state tracing_, which could tell us when threads are running and when they're waiting:
 
 ```
 WARNING: funtrace - error initializing ftrace (...), compile with -DFUNTRACE_FTRACE_EVENTS_IN_BUF=0
   or run under `env FUNTRACE_FTRACE_EVENTS_IN_BUF=0` if you don't want to collect ftrace / see this warning
 ```
 
- You can ignore this message, or disable ftrace as described in the message, or you can try making ftrace work - it's useful for seeing when threads are running vs waiting. The problem is usually permissions, and one way to make ftrace usable permissions-wise is **`sudo chown -R $USER /sys/kernel/tracing`**. Inside containers, things are more involved, and you might want to consult a human or a machine knowing more about it than this guide.
+You can ignore this message, or disable ftrace as described in the message, or you can try making ftrace work. The problem is usually permissions, and one way to make ftrace usable permissions-wise is **`sudo chown -R $USER /sys/kernel/tracing`**. Inside containers, things are more involved, and you might want to consult a source knowing more than this guide.
 
 You can view the traces produced from the simple example above as follows:
 
@@ -62,31 +65,21 @@ vizviewer out/funtrace-xray.json
 
 Funtrace uses [viztracer](https://github.com/gaogaotiantian/viztracer) for visualizing traces, in particular because of its ability to show source code, unlike stock [Perfetto](https://perfetto.dev/) (the basis for vizviewer.)
 
-To build your own program with tracing enabled, you can use `compiler-wrappers/funtrace-pg-g++`, `compiler-wrappers/funtrace-finstr-clang++` or the other two compiler wrapper scripts, just like `simple-example/build.sh` does.
-If the program uses autoconf/configure, you can set the `$CXX` env var to point to one of these scripts, and if it uses cmake, you can pass `-DCMAKE_CXX_COMPILER=/your/chosen/wrapper` to cmake.
+To build your own program with tracing enabled, you can use `compiler-wrappers/funtrace-pg-g++`, `compiler-wrappers/funtrace-finstr-clang++` or the other two compiler wrapper scripts, just like `simple-example/build.sh` does. If the program uses autoconf/configure, you can set the `$CXX` env var to point to one of these scripts, and if it uses cmake, you can pass `-DCMAKE_CXX_COMPILER=/your/chosen/wrapper` to cmake.
 
-Note that the compiler wrappers
-slow down the configuration stage, because they compile & link funtrace.cpp, and this is costly at build system config time if the build system compiles many small programs to test for compiler features, library availability and such.
-For the build itself, the overhead of compiling funtrace.cpp is lower, but might still be annoying if you use a fast linker like mold and are used to near-instantaneous linking. The good thing about the compiler wrappers is that
-they make trying funtrace easy; if you decide to use funtrace in your program, however, you will probably want to pass the required compiler flags yourself as described below, which will eliminate the build-time overhead of the
-compiler wrappers.
+Note that the compiler wrappers slow down the configuration stage, because they compile & link funtrace.cpp, and this is costly at build system config time if the build system compiles many small programs to test for compiler features, library availability and such. For the build itself, the overhead of compiling funtrace.cpp is lower, but might still be annoying if you use a fast linker like mold and are used to near-instantaneous linking. The good thing about the compiler wrappers is that they make trying funtrace easy; if you decide to use funtrace in your program, however, you will probably want to pass the required compiler flags yourself as described below, which will eliminate the build-time overhead of the compiler wrappers.
 
-Once the program compiles, you can run it as usual, and then `killall -SIGTRAP your-program` (or `kill -SIGTRAP <pid>`) when you want to get a trace. The trace will go to `funtrace.raw`; if you use SIGTRAP multiple times, many
-trace samples will be written to the file. Now you can run `funtrace2viz` the way `simple-example/run.sh` does; you should have it compiled if you ran `simple-example/build.sh` - or you could run `RUSTFLAGS="-C target-feature=+crt-static" cargo build -r --target x86_64-unknown-linux-gnu` (the trace decoder is a Rust program; this command compiles it into a static binary with no dependence on any shared libraries.) funtrace2viz will produce a vizviewer JSON file from each trace sample in funtrace.raw, and you can open each JSON file in vizviewer.
+Once the program compiles, you can run it as usual, and then `killall -SIGTRAP your-program` (or `kill -SIGTRAP <pid>`) when you want to get a trace. The trace will go to `funtrace.raw`; if you use SIGTRAP multiple times, many trace samples will be written to the file. Now you can run `funtrace2viz` the way `simple-example/run.sh` does. You get the funtrace2viz binary from `funtrace.zip`; if you cloned the source repo, you should have funtrace2viz compiled if you ran `simple-example/build.sh`. funtrace2viz will produce a vizviewer JSON file from each trace sample in funtrace.raw, and you can open each JSON file in vizviewer.
 
 Troubleshooting vizviewer issues:
 
 * If you see **`Error: RPC framing error`** in the browser tab opened by vizviewer, **reopen the JSON from the web UI**. (Note that you want to run vizviewer on every new JSON file, _even if_ it gives you "RPC framing error" when you do it - you _don't_ want to just open the JSON from the web UI since then you won't see source code!)
 * If **the timeline looks empty**, it's likely due to some mostly-idle threads having very old events causing the timeline to zoom out too much. (You can simply open the JSON with `less` or whatever - there's a line per function call; if the JSON doesn't look empty, funtrace is working.) **Try passing `--max-event-age` or `--oldest-event-time` to funtrace2viz**; it prints the time range of events recorded for each thread in each trace sample (by default, the oldest event in every sample gets the timestamp 0) and you can use these printouts to decide on the value of the flags. In the next section we'll discuss how to take snapshots at the time you want, of the time range you want, so that you needn't fiddle with flags this way.
 
-If you build the program, run it, and decode its trace on the same machine/in the same container, life is easy. If not, note that in order for funtrace2viz to work, you need the program and its shared libraries to be accessible at the paths where they were loaded from _in the traced program run_, on the machine _where funtrace2viz runs_. And to see the source code of the functions (as opposed to just function names), you need the source files to be accessible on that
-machine, at the paths _where they were when the program was built_. If this is not the case, you can remap the paths using a file called `substitute-path.json` in the current directory of funtrace2viz, as described below.
+If you build the program, run it, and decode its trace on the same machine/in the same container, life is easy. If not, note that in order for funtrace2viz to work, you need the program and its shared libraries to be accessible at the paths where they were loaded from _in the traced program run_, on the machine _where funtrace2viz runs_. And to see the source code of the functions (as opposed to just function names), you need the source files to be accessible on that machine, at the paths _where they were when the program was built_. If this is not the case, you can remap the paths using a file called `substitute-path.json` in the current directory of funtrace2viz, as described below.
 As a side note, if you don't like having to remap source file paths - not just in funtrace but eg in gdb - see [refix](https://github.com/yosefk/refix) which can help to mostly avoid this.
 
-Note that if you choose to try XRay instrumentation (`compiler-wrappers/funtrace-xray-clang++`), you need to run with `env XRAY_OPTIONS="patch_premain=true"` like simple-examples/run.sh does. With the other instrumentation options,
-tracing is on by default.
-
-**TODO** binary releases of the decoding tools
+Note that if you choose to try XRay instrumentation (`compiler-wrappers/funtrace-xray-clang++`), you need to run with `env XRAY_OPTIONS="patch_premain=true"` like simple-examples/run.sh does. With the other instrumentation options, tracing is on by default.
 
 The above is how you can give funtrace a quick try. The rest tells how to integrate it in your program "for real."
 
