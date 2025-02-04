@@ -54,7 +54,7 @@ struct Cli {
     dry: bool,
     #[clap(short, long, help="ignore samples with indexes outside this list")]
     samples: Vec<u32>,
-    #[clap(short, long, help="ignore threads with indexes outside this list (including for the purpose of interpreting --max-event-age)")]
+    #[clap(short, long, help="ignore threads with TIDs outside this list (including for the purpose of interpreting --max-event-age)")]
     threads: Vec<u64>,
 }
 

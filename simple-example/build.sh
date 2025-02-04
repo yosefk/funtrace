@@ -3,7 +3,9 @@ set -ex
 
 # building the offline conversion tools:
 ########################################
-RUSTFLAGS="-C target-feature=+crt-static" cargo build -r --target x86_64-unknown-linux-gnu
+if [ -e Cargo.toml ]; then
+	RUSTFLAGS="-C target-feature=+crt-static" cargo build -r --target x86_64-unknown-linux-gnu
+fi
 
 # building tests using the funtrace instrumentation & runtime:
 ##############################################################
