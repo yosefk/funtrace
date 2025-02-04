@@ -151,7 +151,7 @@ funtrace: done - decode with `funtrace2viz funtrace.raw out` and then view in vi
 
 Basically it's what SIGTRAP would save to `funtrace.raw`, had it been called right when the core was dumped. Can be very useful to see what the program was doing right before it crashed.
 
-# Choosing compiler instrumentation
+# Choosing a compiler instrumentation method
 
 Once you have snapshots of the right time ranges, you might want to settle on a particular compiler instrumentation method. For that, the below can be helpful as well as the next section, which talks about culling overhead with the `funcount` tool (one thing which will help you choose the instrumentation method is how much overhead it adds, which differs between programs, and funcount can help estimate that overhead.)
 
@@ -193,7 +193,8 @@ A few more words about XRay:
 
 # Integrating funtrace into your build system
 
-The short story is, **choose an instrumentation method and then compile in the way the respective wrapper in compiler-wrappers does.** However, here are some points worth noting explicitly:
+You can postpone "real" build system integration for as long as you want, if the compiler wrappers don't slow things down too much for you.
+Once you do want to integrate funtrace into your build system, the short story is, **choose an instrumentation method and then compile in the way the respective wrapper in compiler-wrappers does.** However, here are some points worth noting explicitly:
 
 * **It's fine to compile funtrace.cpp with its own compilation command.** You probably don't want to compile funtrace.cpp when linking your binary the way the wrappers do. They only do it to save you the trouble of adding funtrace.cpp to the list of files for the build system to build (which is harder/more annoying than it sounds, if you're trying to trace someone else's program with a build system you don't really know.)
 * **It's best to compile funtrace.cpp without tracing, but "it can handle" being compiled with tracing.** Many build systems make it hard to compile a given file with its own compiler flags. funtrace.cpp uses NOFUNTRACE heavily to suppress tracing; the worst that can happen if you compile it with tracing is that some of its code will be traced despite its best efforts, but it should otherwise work.
@@ -212,7 +213,7 @@ All the compiler wrappers execute `compiler-wrappers/funtrace++`, itself a compi
 
 # Culling overhead with `funcount`
 
-If tracing slows down your program too much, you might want to exclude some functions from tracing. You can do this on some "wide basis", such as "no tracing inside this bunch of libraries, we do compile higher-level logic to trace the overall flow" or such. You can also use `-fxray-instruction-threshold` or `-funtrace-instr-thresh` to automatically exclude short functions without loops. But you might also want to do some "targeted filtering" where you find functions called very often, and exclude those (to save both cycles and space in the trace buffer - with many short calls, you need a much larger snapshot to see far enough into the past.)
+If tracing slows down your program too much, you might want to exclude some functions from tracing. You can do this on some "wide basis", such as "no tracing inside this bunch of libraries, we do compile higher-level logic to trace the overall flow" or such. You can also use `-fxray-instruction-threshold` or `-funtrace-instr-thresh` to automatically exclude short functions without loops. But you might also want to do some "targeted filtering" where you **find functions called very often, and exclude those** (to save both cycles and space in the trace buffer - with many short calls, you need a much larger snapshot to see far enough into the past.)
 
 `funcount` is a tool for counting function calls, which is recommended for finding "frequent callees" to exclude from traces. Funcount is:
 
@@ -227,7 +228,7 @@ You enable funcount by passing `-DFUNTRACE_FUNCOUNT` on the command line (only `
 
 At the end of the run, you will see the message:
 
-`function call count report saved to funcount.txt - decode with funcount2sym to get: call_count, dyn_addr, static_addr, num_bytes, bin_file, src_file, src_line, mangled_func_name`
+`function call count report saved to funcount.txt - decode with funcount2sym to get: call_count, dyn_addr, static_addr, num_bytes, bin_file, src_file:src_line, mangled_func_name`
 
 `funcount2sym funcount.txt` prints the columns described in the message to standard output; the most commonly interesting ones are highlighted in bold:
 
@@ -236,16 +237,38 @@ At the end of the run, you will see the message:
 * `static_addr` - the static address of the function in the binary file (what you'd see with `nm`)
 * `num_bytes` - the number of bytes making up the function, a proxy for how many instructions long it is
 * `bin_file` - the executable or shared library containing the function
-* **`src_file` - the source file where the function is defined**
-* **`src_line` - the source line number**
+* **`src_file:src_line` - the source file & line where the function is defined**, separated by ":"
 * **`mangled_func_name` - the mangled function name**; you can pipe funcount2sym through `c++filt` to demangle it, though often you will want the mangled name
 
-You sort this report with `sort -nr` and add reports from multiple runs together with `awk`.
+You can sort this report with `sort -nr` and add reports from multiple runs together with `awk`. To exclude frequently called functions from tracing, you can use the `NOFUNTRACE` attribute (as in `void NOFUNTRACE myfunc()`); `#include "funtrace.h"` to access the macro. You can also use the `-funtrace-no-trace=file` flag implemented by `funtrace++`, and pass it a file with a list of _mangled_ function names. See also "Disabling and enabling tracing" below. This might be faster than opening every relevant source file and adding `NOFUNTRACE` to every excluded function definition, and it avoids issues where the function attribute doesn't exclude the function for whatever reason.
 
+The advantage of the NOFUNTRACE attribute, apart from being kept together with the function definition (so you know easily what's traced and what's not), is that the overhead is **fully** removed, whereas `-funtrace-no-trace=file` only removes most of the overhead - it removes the calls to the entry/exit hooks, but the code is still "scarred" by the code having been generated. This is a small fraction of the overhead but if lots and lots of functions are "scarred" this way, it can add up.
 
-
+If the source files aren't where the debug info says they are, and/or the executable or shared objects are not where they were when the process was running, you can use `substitute-path.json` in the current directory of `funcount2sym` same as with `funtrace2viz`, as described in the next section.
 
 # Decoding traces
+
+`funtrace2viz funtrace.raw out` will produce an `out.json`, `out.1.json`, `out.2.json` etc. per trace sample in the file. (The snapshot-saving functions only put one sample into a file; the `funtrace.raw` file appended to by SIGTRAP and its programmatic equivalent can contain multiple samples.)
+
+If funtrace2viz can't find some of the source files or binaries it needs, it will print warnings; you can make it find the files using a `substitute-path.json` in its current directory. This JSON file should contain an array of arrays of length 2, for example:
+
+``` json
+[
+  ["/build/server/source-dir/","/home/user/source-dir/"],
+  ["/deployment/machine/binary-dir/","/home/user/binary-dir/"],
+]
+```
+For every path string, funtrace2viz iterates over every pair in the array, replacing every occurence of the first string with the second string in the pair.
+
+Command line flags:
+
+* `-r/--raw-timestamps`: report the raw timestamps, rather than defining the earliest timestamp in each sample as 0 and counting from there
+* `-e/--executable-file-info`: on top of a function's name, file & line, show the binary it's from and its static address
+* `-m/--max-event-age`: ignore events older than this age; this is most likely to be useful for SIGTRAP-type snapshots where you have very old events from mostly idle threads and they cause the GUI timeline to zoom out so much you can't see anything. You can guess what the age is in part by looking at the printouts of funtrace2viz which tells the time range of the events traced from each thread
+* `-e/--oldest-event-time`: like `--max-event-age` but with the threshold defined as a timestamp instead of age
+* `-t/--threads`: a comma-separated list of thread TIDs - threads outside this list are ignored (including for the purpose of interpreting `--max-event-age` - if you ignore the thread with the most recent event, then the most recent event from threads you didn't ignore becomes "the most recent event" for age calculation purposes.) This is also something that's mostly useful for SIGTRAP-type snapshots to exclude mostly idle threads
+* `-s/--samples`: a comma-separated list of sample indexes - samples outside this list are ignored. Useful for the multi-sample `funtrace.raw` file appended to by SIGTRAP
+* `-d/--dry`: useful for a very large multi-sample `funtrace.raw` file if you want to decide what samples to focus on; this prints the time ranges of the threads in each sample, but doesn't decode anything (decoding runs at a rate of about 1MB of binary data per second)
 
 # Compile-time & runtime configuration
 
@@ -309,7 +332,7 @@ You don't need to know this format unless you want to generate or process `funtr
 
 Funtrace data is binary, using little endian encoding for integers. It consists of "chunks" where each chunk has an 8-byte magic number, a 64-bit size integer, and then a sequence of data bytes of the length specified by the size integer. Here are the chunk types and the format of the data:
 
-* **`PROCMAPS`**: the content of `/proc/self/maps` can go here; only the start, end, offset and path fields are used, and only the executable segments are listed at this stage (funtrace uses `dl_iterate_phdr` rather than `/proc/self/maps` to speed up snapshotting), but readonly data segments might go here eventually, too, eg if we implement custom log messages with (delayed formatting)[https://yosefk.com/blog/delayed-printf-for-real-time-logging.html]. Only the start, end, offset and path fields are used; permissions and inode info are ignored.
+* **`PROCMAPS`**: the content of `/proc/self/maps` can go here; only the start, end, offset and path fields are used, and only the executable segments are listed at this stage (funtrace uses `dl_iterate_phdr` rather than `/proc/self/maps` to speed up snapshotting), but readonly data segments might go here eventually, too, eg if we implement custom log messages with [delayed formatting](https://yosefk.com/blog/delayed-printf-for-real-time-logging.html). Only the start, end, offset and path fields are used; permissions and inode info are ignored.
 * **`FUNTRACE`**: an 8-byte chunk indicating the start of a snapshot, with an 8-byte frequency of the timestamp counter, used to convert counter values into nanoseconds. A snapshot is interpreted according to the memory map reported by the last encountered `PROCMAPS` chunk (there may be many snapshots in the same file; currently the funtrace runtime saves a `PROCMAPS` chunk every time it takes a snapshot but if you know that your memory map remains stable over time and you want to shave off a little bit of latency, you could tweak this.)
 * **`CMD LINE`**: the process command line, used as the process name when generating the JSON. A wart worth mentioning is that currently, the funtrace runtime reads this from `/proc/self/cmdline` and replaces null characters separating the arguments with spaces, which means that the shell command `prog "aaa bbb"`, which passes a single string argument `aaa bbb`, will be saved as `prog aaa bbb` (two string arguments). So we save enough to help you see "the trace of what you're looking at" but not enough to eg use the saved command line for reproducing the run.
 * **`THREADID`**: a 64b PID integer, a 64b TID integer, and a null-terminated 16-byte name string (the content of `/proc/self/comm` aka the output of `pthread_getname_np(pthread_self(),...)`.) This precedes every `TRACEBUF` chunk (documented next.)
@@ -317,4 +340,5 @@ Funtrace data is binary, using little endian encoding for integers. It consists 
   * `RETURN` (63): a return event, where the code pointer points into the returning function
   * `RETURN_WITH_CALLER_ADDRESS` (62): a return event where the code pointer points _into the function we're returning to_. This unfortunate tracing artifact happens under XRay instrumentation; funtrace2viz mostly recovers the flow despite this. When this bit and the previous bit are both set, this is a `CATCH` event, and the code pointer points into the function that caught the exception.
   * `CALL_RETURNING_UPON_THROW` (61): marks call events that will have a return event logged for them if an exception is thrown. Under most instrumentation methods this does not happen and so funtrace2viz guesses which functions effectively returned during stack unwinding. When it sees a call entry with this flag set, it knows that this function wouldn't return without logging a return event even if an exception was thrown, which prevents it from wrongly guessing that the function returned due to unwinding.
+* **`FTRACETX`**: a variable-sized chunk containing textual ftrace data (one event per line - what you read from `/sys/kernel/tracing/trace_pipe`). The timestamps in this data and the trace entries from `TRACEBUF` are from the same time source.
 * **`ENDTRACE`**: an zero-sized chunk marking the end of a snapshot.
