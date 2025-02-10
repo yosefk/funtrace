@@ -268,6 +268,8 @@ asm_filter_ref = fn('short_but_whitelisted') + fn('long_enough_function') + fn('
 # another build for the same code - without the whitelist & blacklist and with loops ignored
 asm_filter_2_ref = fn('long_enough_function') + fn('long_but_blacklisted')
 
+c_ref = fn('g', fn('f')*2)
+
 freq_ref = [
     (call,'usleep_1500'),
     (ret,'usleep_1500'),
@@ -475,6 +477,7 @@ def main():
     buildcmds('asm_filter_2.cpp',flags=f'-funtrace-instr-thresh=20 -funtrace-ignore-loops')
     buildcmds('shared.cpp',shared=['lib_shared.cpp'],dyn_shared=['lib_dyn_shared.cpp'])
     buildcmds('count.cpp',shared=['count_shared.cpp'],dyn_shared=['count_dyn_shared.cpp'],flags='-DFUNTRACE_FUNCOUNT -DFUNCOUNT_PAGE_TABLES=2')
+    buildcmds('c.c')
     pool.map(run_cmds, cmdlists)
 
     cmdlists = []
@@ -560,6 +563,9 @@ def check():
         ftrace = load_ftrace(json)
         threads = load_threads(json)
         check_ftrace(ftrace, threads)
+    for json in jsons('c'):
+        print('checking',json)
+        assert verify_thread(load_thread(json), c_ref)
 
     # funcount test
     for symcount_txt in sorted(glob.glob(f'{OUTDIR}/count.*/symcount.txt')):
