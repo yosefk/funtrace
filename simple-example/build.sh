@@ -1,6 +1,12 @@
 #!/bin/sh
 set -ex
 
+cleanup() {
+	rm *.o
+}
+
+trap cleanup EXIT
+
 # building the offline conversion tools:
 ########################################
 if [ -e Cargo.toml ]; then
@@ -38,8 +44,7 @@ $CXX -o out/test_trace.fi-clang test.o out/test_shared.finstr.so $CXXFLAGS
 
 CXX=./compiler-wrappers/funtrace-xray-clang++
 $CXX -c simple-example/shared.cpp -fPIC $CLANGXRAYFLAGS
+# this command will fail with older clang
 $CXX -o out/test_shared.xray.so shared.o -fPIC -shared $CLANGXRAYFLAGS
 $CXX -c simple-example/test.cpp $CLANGXRAYFLAGS
 $CXX -o out/test_trace.xray test.o out/test_shared.xray.so $CLANGXRAYFLAGS
-
-rm *.o

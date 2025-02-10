@@ -14,6 +14,8 @@ rm funtrace.raw
 ./target/x86_64-unknown-linux-gnu/release/funtrace2viz funtrace.raw out/funtrace-fi-clang
 rm funtrace.raw
 
-env XRAY_OPTIONS="patch_premain=true" ./out/test_trace.xray
-./target/x86_64-unknown-linux-gnu/release/funtrace2viz funtrace.raw out/funtrace-xray
-rm funtrace.raw
+if [ -e ./out/test_trace.xray ]; then
+	env XRAY_OPTIONS="patch_premain=true" ./out/test_trace.xray
+	./target/x86_64-unknown-linux-gnu/release/funtrace2viz funtrace.raw out/funtrace-xray
+	rm funtrace.raw
+fi
