@@ -10,6 +10,21 @@ Unlike a sampling profiler such as perf, **a tracing profiler must be told what 
 
 If you're interested in why tracing profilers are useful and how funtrace works, see [Profiling in production with function call traces](https://yosefk.com/blog/profiling-in-production-with-function-call-traces.html). What follows is a funtrace user guide.
 
+- [Why funtrace?](#why-funtrace)
+- [Trying funtrace](#trying-funtrace)
+- [Runtime API for taking & saving trace snapshots](#runtime-api-for-taking--saving-trace-snapshots)
+- ["Coretime" API for saving trace snapshots](#coretime-api-for-saving-trace-snapshots)
+- [Choosing a compiler instrumentation method](#choosing-a-compiler-instrumentation-method)
+- [Integrating funtrace into your build system](#integrating-funtrace-into-your-build-system)
+- [Culling overhead with `funcount`](#culling-overhead-with-funcount)
+- [Decoding traces](#decoding-traces)
+- [Compile time & runtime configuration](#compile-time--runtime-configuration)
+  - [Controlling which functions are traced](#controlling-which-functions-are-traced)
+  - [Disabling & enabling tracing](#disabling--enabling-tracing)
+  - [Controlling buffer sizes & lifetimes](#controlling-buffer-sizes--lifetimes)
+- [Limitations](#limitations)
+- [Funtrace file format](#funtrace-file-format)
+
 # Why funtrace?
 
 * **Low overhead tracing** (FWIW, in my microbenchmark I get <10 ns per instrumented call or return -
@@ -27,7 +42,7 @@ If you're interested in why tracing profilers are useful and how funtrace works,
 
 # Trying funtrace
 
-You can clone the repo & build the trace decoder (or uinzip a binary release), compile & run a simple example program, and decode its output traces as follows:
+You can clone the repo & build the trace decoder (or uinzip [a binary release](https://github.com/yosefk/funtrace/releases)), compile & run a simple example program, and decode its output traces as follows:
 
 ``` shell
 # clone the source...
@@ -217,7 +232,7 @@ If tracing slows down your program too much, you might want to exclude some func
 
 Finally, funcount **counts exactly the calls funtrace would trace** - nothing that's not traced is counted, and nothing that's traced is left uncounted.
 
-You enable funcount by passing `-DFUNTRACE_FUNCOUNT` on the command line (only `funtrace.cpp` needs this -D, you don't really need to recompile the whole program), or by compiling & linking `funcount.cpp` instead of `funtrace.cpp` into your program - whichever is easier in your build system. If the program runs much slower than with funtrace (which can be very slow if you instrument before inlining but otherwise is fairly fast), it must be multithreaded, with the threads running the same concurrently and fighting over the ownership of the cache lines containing the call counters maintained by funcount. You can compile with `-DFUNCOUNT_PAGE_TABLES=16` or whatever number to have each CPU core update its own copy of each call counter, getting more speed in exchange for space (not that much space - each page table is at worst the size of the executable sections, though on small machines this might matter.)
+You enable funcount by passing `-DFUNTRACE_FUNCOUNT` on the command line (only `funtrace.cpp` and `funtrace_pg.S` need this -D, you don't really need to recompile the whole program), or by compiling & linking `funcount.cpp` and `funcount_pg.S` instead of `funtrace.cpp` and `funtrace_pg.S` into your program - whichever is easier in your build system. If the program runs much slower than with funtrace (which can be very slow if you instrument before inlining but otherwise is fairly fast), it must be multithreaded, with the threads running the same concurrently and fighting over the ownership of the cache lines containing the call counters maintained by funcount. You can compile with `-DFUNCOUNT_PAGE_TABLES=16` or whatever number to have each CPU core update its own copy of each call counter, getting more speed in exchange for space (not that much space - each page table is at worst the size of the executable sections, though on small machines this might matter.)
 
 At the end of the run, you will see the message:
 
