@@ -27,8 +27,9 @@ If you're interested in why tracing profilers are useful and how funtrace works,
 
 # Why funtrace?
 
-* **Low overhead tracing** (FWIW, in my microbenchmark I get <10 ns per instrumented call or return -
-  6 times faster than an LLVM XRay microbenchmark with "flight recorder logging" and 15-18 times faster than "basic logging")
+* **Low overhead tracing** - FWIW, in my microbenchmark I get <10 ns per instrumented call or return
+  * **6x faster** than an LLVM XRay microbenchmark with "flight recorder logging" and 15-18x faster than "basic logging"
+  * **4.5x faster** than a uftrace microbenchmark (note that uftrace isn't just designed for a somewhat different workflow than funtrace - in that it's similar to XRay - but it also has many more features; [check it out](https://github.com/namhyung/uftrace)!)
 * Supports **threads, shared libraries and exceptions**
 * Supports ftrace events, showing **thread scheduling states** alongside function calls & returns, so you see when time is spent waiting as opposed to computing
 * Works with **stock gcc or clang** - no custom compilers or compiler passes
