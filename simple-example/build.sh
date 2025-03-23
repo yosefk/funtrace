@@ -26,9 +26,9 @@ mkdir -p out
 
 CXX=./compiler-wrappers/funtrace-finstr-g++
 $CXX -c simple-example/shared.cpp -fPIC $CXXFLAGS
-$CXX -o out/test_shared.finstr.so shared.o -fPIC -shared $CXXFLAGS
+$CXX -o out/test_shared.fi-gcc.so shared.o -fPIC -shared $CXXFLAGS
 $CXX -c simple-example/test.cpp $CXXFLAGS
-$CXX -o out/test_trace.fi-gcc test.o out/test_shared.finstr.so $CXXFLAGS
+$CXX -o out/test_trace.fi-gcc test.o out/test_shared.fi-gcc.so $CXXFLAGS
 
 CXX=./compiler-wrappers/funtrace-pg-g++
 $CXX -c simple-example/shared.cpp -fPIC $CXXFLAGS
@@ -38,9 +38,9 @@ $CXX -o out/test_trace.pg test.o out/test_shared.pg.so $CXXFLAGS
 
 CXX=./compiler-wrappers/funtrace-finstr-clang++
 $CXX -c simple-example/shared.cpp -fPIC $CXXFLAGS
-$CXX -o out/test_shared.finstr.so shared.o -fPIC -shared $CXXFLAGS
+$CXX -o out/test_shared.fi-clang.so shared.o -fPIC -shared $CXXFLAGS
 $CXX -c simple-example/test.cpp $CXXFLAGS
-$CXX -o out/test_trace.fi-clang test.o out/test_shared.finstr.so $CXXFLAGS
+$CXX -o out/test_trace.fi-clang test.o out/test_shared.fi-clang.so $CXXFLAGS
 
 CXX=./compiler-wrappers/funtrace-xray-clang++
 $CXX -c simple-example/shared.cpp -fPIC $CLANGXRAYFLAGS

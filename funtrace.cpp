@@ -564,7 +564,7 @@ static int NOINSTR phdr_callback (struct dl_phdr_info *info, size_t size, void *
             uint64_t start_addr = info->dlpi_addr + phdr.p_vaddr;
             uint64_t end_addr = start_addr + phdr.p_memsz;
             const char* name = info->dlpi_name[0] ? info->dlpi_name : trace_state().exe_path;
-            s << start_addr << '-' << end_addr << " r-xp " << phdr.p_vaddr << " 0:0 0 " << name << '\n';
+            s << start_addr << '-' << end_addr << " r-xp " << phdr.p_offset << " 0:0 0 " << name << '\n';
         }
     }
     return 0;
